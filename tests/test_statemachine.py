@@ -344,8 +344,10 @@ def test_repeat_confrontations_get_shorter(settings, store, clock):
         store.set_detour(conv.anchor.id, None)
         conv.state = State.WATCHING
         out = conv.confront(observed())
-        roast_part = out.spoken[0].replace(R.choice_line("en"), "").strip()
-        lengths.append(len(roast_part.split()))
+        roast_part = out.spoken[0]
+        for variant in R.CHOICE_VARIANTS["en"]:
+            roast_part = roast_part.replace(variant, "")
+        lengths.append(len(roast_part.strip().split()))
     assert lengths[0] >= lengths[1] >= lengths[2]
     assert lengths[2] <= 8
 

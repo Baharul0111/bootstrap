@@ -107,7 +107,8 @@ class RoutedListener(FakeListener):
         if self.replies:
             return super().listen(window_s=window_s, language=language)
         self.calls.append((window_s, language))
-        return self.on_choice if self.last().endswith(R.choice_line("en")) else ""
+        last = self.last()
+        return self.on_choice if any(last.endswith(v) for v in R.CHOICE_VARIANTS["en"]) else ""
 
 
 class DiesListening(FakeListener):

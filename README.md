@@ -1,8 +1,19 @@
-# Anchor
+# Booty Goblin (Team Bootstrap)
 
-A quiet macOS menu-bar helper that holds you to the one sentence you said you were going to do.
+Formerly "Anchor". The Python package is still called `anchor`; the product and the voice are **Booty Goblin**.
+
+Booty Goblin is a quiet macOS menu-bar helper that holds you to the one sentence you said you were going to do.
 It asks out loud what you are working on, watches the whole desktop once a second, and only speaks
 when you have really drifted: one short roast about the situation, then a plain question.
+
+## Videos
+
+- **Demo:** [booty-goblin-demo-video.mp4](booty-goblin-demo-video.mp4) — the product in use: goal spoken aloud, a drift caught within seconds, the roast, the forced choice, the break and the reminder.
+- **Process:** [booty-goblin-process-video.mp4](booty-goblin-process-video.mp4) — how it was built.
+
+<video src="booty-goblin-demo-video.mp4" controls width="720"></video>
+
+<video src="booty-goblin-process-video.mp4" controls width="720"></video>
 
 ## Run it
 

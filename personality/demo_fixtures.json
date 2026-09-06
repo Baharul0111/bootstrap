@@ -1,6 +1,7 @@
 {
   "_comment": "DEMO FIXTURES, not live evidence. Merged over personality/booty_globlin.json when ANCHOR_PERSONA_FIXTURES=demo (run.sh sets that by default; ANCHOR_PERSONA_FIXTURES=off disables). They preset savage intensity and the hackathon context (a public, team build with AI assisting) so all approved lines can rotate on stage. Paid-plan and imposter-syndrome facts stay false: those are never invented.",
   "intensity": "savage",
+  "force_library_rotation": true,
   "tease_material": "",
   "exclusions": [],
   "facts": {

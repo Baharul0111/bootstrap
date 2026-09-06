@@ -396,6 +396,11 @@ ROTATION_NOTE = (
 )
 
 
+def _choice_key(text: str) -> str:
+    """Near-duplicate key for choice lines: lowercase content words only."""
+    return " ".join(w for w in re.findall(r"[a-zA-Zऀ-ॿ']+", (text or "").lower()) if len(w) > 3)
+
+
 def _without_approved_lines(text: str) -> str:
     """The creator-approved library lines are exempt from the banned-term scan (R02 says 'lazy' about
     an instruction to Claude, not about the person); everything around them is still checked."""
@@ -562,10 +567,28 @@ def hedged_statement(anchor: Anchor, observed: Observed, language: str) -> str:
     return f"This might be part of it, but it seems to be {act} for about {m} minutes."
 
 
-def choice_line(language: str) -> str:
-    if _lang(language) == "hi":
-        return "एक छोटा सवाल: यह थोड़ी देर का ब्रेक है, या अब यही मुख्य काम है?"
-    return "Quick one: is this a short break, or is this the new main thing?"
+CHOICE_VARIANTS = {
+    "en": [
+        "Quick one: is this a short break, or is this the new main thing?",
+        "So which is it: a short break, or the new main thing?",
+        "Break, or new main thing? Pick one.",
+        "Short pause, or is this the new main thing now?",
+        "Is this a timeout, or the new main thing?",
+        "Two options: a short break, or this is the new main thing.",
+    ],
+    "hi": [
+        "एक छोटा सवाल: यह थोड़ी देर का ब्रेक है, या अब यही मुख्य काम है?",
+        "तो बताइए: छोटा ब्रेक, या अब यही मुख्य काम?",
+        "ब्रेक है, या नया मुख्य काम? एक चुनिए।",
+        "थोड़ा रुकना है, या यही अब असली काम बन गया?",
+    ],
+}
+
+
+def choice_line(language: str, index: int = 0) -> str:
+    """The forced choice. ``index`` rotates the wording so repeats never sound identical."""
+    variants = CHOICE_VARIANTS["hi" if _lang(language) == "hi" else "en"]
+    return variants[max(0, int(index or 0)) % len(variants)]
 
 
 def pushback_line(verbatim: str, language: str) -> str:
@@ -795,7 +818,7 @@ class Composer:
     ) -> Composition:
         lang = _lang(language)
         idx = max(0, int(repeat_index or 0))
-        template_choice = choice_line(lang)
+        template_choice = choice_line(lang, len(self.delivered))     # a different wording each confrontation
         try:
             reg = Register(register)
         except ValueError:
@@ -832,6 +855,9 @@ class Composer:
             if result is None:
                 continue
             pick = self._accept(result, observed, idx, eligible, profanity_ok, sentence_cap, word_cap)
+            force_rotation = bool((getattr(self.personality, "fixtures", {}) or {}).get("force_library_rotation"))
+            if force_rotation and pick is not None and eligible and pick.roast_id not in {l.id for l in eligible}:
+                pick = None          # stage rule: while unused approved lines remain, one of them must be used
             if pick is not None:
                 break
 
@@ -848,7 +874,15 @@ class Composer:
         self.delivered.append(pick.roast)
         if pick.roast_id:
             self.used_ids.add(pick.roast_id)
-        choice = pick.choice.strip() if self._choice_acceptable(pick.choice, profanity_ok) else template_choice
+        delivered_choices: list[str] = getattr(self, "delivered_choices", [])
+        model_choice = pick.choice.strip() if self._choice_acceptable(pick.choice, profanity_ok) else ""
+        # The model's question is used only when it is genuinely new; otherwise the wording rotates.
+        if model_choice and all(_choice_key(model_choice) != _choice_key(c) for c in delivered_choices):
+            choice = model_choice
+        else:
+            choice = template_choice
+        delivered_choices.append(choice)
+        self.delivered_choices = delivered_choices
         return Composition(
             pick.roast, choice, True, delivery=pick.delivery, roast_id=pick.roast_id, mechanism=pick.mechanism
         )
