@@ -63,7 +63,10 @@ class Store:
             pass
         try:
             self._conn = self._connect()
-            self._conn.execute("PRAGMA integrity_check").fetchone()
+            verdict = self._conn.execute("PRAGMA integrity_check").fetchone()
+            if verdict is None or str(verdict[0]).strip().lower() != "ok":
+                # Subtler damage (a bad freelist, a broken index) is reported as rows, not raised.
+                raise sqlite3.DatabaseError(f"integrity check failed: {verdict[0] if verdict else 'no result'}")
             self._conn.executescript(SCHEMA)
         except sqlite3.DatabaseError:
             if self._conn is not None:

@@ -39,6 +39,11 @@ TONE_BRIEFS = {  # instructions for TTS by tone; the three delivery tags refine 
     "neutral": "Clear, friendly and brief.",
 }
 HINDI_BRIEF = " Speak natural, everyday Hindi."
+ACCENT_BRIEF = (
+    " Accent: authentic Indian English, exactly how an educated woman from Delhi or Mumbai speaks English every day."
+    " Indian English intonation and rhythm (syllable-timed, gentle rise-and-fall melody), Indian vowel colouring,"
+    " retroflex t and d, clear rolled r, softened w/v. Absolutely not American and not British. Natural, not a caricature."
+)
 _ROAST_TAGS = ("roast", "deadpan", "mock_respect", "disbelief")
 
 
@@ -46,7 +51,7 @@ def tts_brief(tone: str, language: str) -> str:
     """The performance instruction for one utterance. Hindi roasts keep the persona's manner, in Hindi."""
     brief = TONE_BRIEFS.get(tone, TONE_BRIEFS["neutral"])
     if language != "hi":
-        return brief
+        return brief + ACCENT_BRIEF
     if tone in _ROAST_TAGS:
         return brief.replace(
             "Speak in clear, natural English with a light Indian conversational cadence.",
@@ -57,8 +62,10 @@ def tts_brief(tone: str, language: str) -> str:
 TTS_RATE = 24_000            # gpt-4o-mini-tts "pcm" output: 24 kHz mono int16
 STT_RATE = 16_000            # capture rate for webrtcvad and transcription
 FRAME_SAMPLES = 480          # 30 ms at 16 kHz, the largest frame webrtcvad accepts
-TRAIL_SILENCE_FRAMES = 22    # 0.66 s of silence ends an utterance (the reply must feel immediate)
+TRAIL_SILENCE_FRAMES = 14    # 0.42 s of silence ends an utterance (the reply must feel immediate)
 PREROLL_FRAMES = 10          # 300 ms kept from just before speech onset
+ONSET_FRAMES = 3             # 90 ms of confirmed speech starts an utterance
+MAX_UTTERANCE_FRAMES = 300   # 9 s: the longest reply we will ever wait to transcribe
 
 
 class SayFallbackSpeaker:
@@ -217,28 +224,48 @@ class OpenAIListener:
         import sounddevice as sd
         import webrtcvad
 
-        vad = webrtcvad.Vad(2)
+        vad = webrtcvad.Vad(3)                  # most aggressive: room noise and the speaker's tail are not speech
         deadline = time.monotonic() + window_s  # hard cap on total capture, whatever the VAD says
         preroll: deque = deque(maxlen=PREROLL_FRAMES)
         frames: list = []
-        speaking, silent = False, 0
+        speaking, silent, onset = False, 0, 0
+        noise_floor = 0.0
+        levels: list = []
+
+        def loudness(raw: bytes) -> float:
+            try:
+                import numpy as np
+
+                arr = np.frombuffer(raw, dtype=np.int16)
+                return float(np.abs(arr.astype(np.int32)).mean()) if arr.size else 0.0
+            except Exception:
+                return 1e9                      # no numpy: fall back to the VAD alone
+
         with sd.InputStream(samplerate=STT_RATE, channels=1, dtype="int16", blocksize=FRAME_SAMPLES) as mic:
             while time.monotonic() < deadline:
                 data, _overflowed = mic.read(FRAME_SAMPLES)
                 frame = bytes(data)
-                is_speech = vad.is_speech(frame, STT_RATE)
+                level = loudness(frame)
+                if not speaking and len(levels) < 8:
+                    levels.append(level)        # the first ~240 ms are the room: they set the noise floor
+                    noise_floor = sorted(levels)[len(levels) // 2]
+                # speech = the VAD agrees AND the frame is clearly louder than the room
+                is_speech = vad.is_speech(frame, STT_RATE) and (
+                    noise_floor <= 0.0 or level > max(2.5 * noise_floor, 250.0)   # a real mic always has a floor
+                )
                 if not speaking:
-                    if is_speech:
+                    preroll.append(frame)
+                    onset = onset + 1 if is_speech else 0
+                    if onset >= ONSET_FRAMES:   # a real word, not a click
                         speaking = True
                         frames.extend(preroll)
-                        frames.append(frame)
-                    else:
-                        preroll.append(frame)
                     continue
                 frames.append(frame)
                 silent = 0 if is_speech else silent + 1
                 if silent >= TRAIL_SILENCE_FRAMES:
                     break
+                if len(frames) >= MAX_UTTERANCE_FRAMES:
+                    break                       # a reply is a sentence, not a speech
         if not speaking:
             return None
         buf = io.BytesIO()

@@ -137,6 +137,29 @@ def test_break_without_amount_asks_how_long_once(settings, store, clock):
     assert out.pushed is False                                   # asking "how long" is not the push-back
 
 
+@pytest.mark.parametrize("answer,minutes", [("One minute.", 1), ("a minute", 1), ("just a minute", 1), ("ek minute", 1), ("एक मिनट", 1), ("five", 5), ("half an hour", 30)])
+def test_how_long_answer_is_always_literal(settings, store, clock, answer, minutes):
+    conv, speaker, _ = anchored(settings, store, clock, replies=["Just a short break.", answer])
+    out = conv.confront(observed())
+    assert out.intent == Intent.DEFER and out.minutes == minutes
+    assert str(minutes) in speaker.calls[-1][0]
+
+
+def test_fresh_start_asks_again_and_cancels_a_pending_break(settings, store, clock):
+    conv, _, _ = anchored(settings, store, clock, replies=["twenty minutes"])
+    conv.confront(observed())
+    assert store.active_anchor().detour_until is not None
+    settings.fresh_start = True                                 # the default in real use (ANCHOR_RESUME=1 disables)
+    conv2, speaker2, _ = make_conv(settings, store, clock, ["write the lab report"])
+    conv2.start_session()
+    assert conv2.anchor.verbatim == "write the lab report" and conv2.state == State.WATCHING
+    assert any("working on right now" in t for t, _, _ in speaker2.calls)
+    assert store.get_anchor(conv.anchor.id).status == "retired"
+    assert store.get_anchor(conv.anchor.id).detour_until is None
+    from anchor.config import Settings
+    assert Settings.from_env().fresh_start is True
+
+
 def test_break_without_amount_and_silence_takes_default(settings, store, clock):
     conv, speaker, listener = anchored(settings, store, clock, replies=["I need a break", ""])
     out = conv.confront(observed())
@@ -334,7 +357,7 @@ def test_low_confidence_gets_hedge_not_joke(settings, store, clock):
     conv, speaker, _ = anchored(settings, store, clock, replies=["ten minutes"])
     out = conv.confront(observed(confidence=0.5))
     assert out.joke_used is False
-    assert speaker.calls[-2][2] != "roast"
+    assert speaker.calls[-2][2] not in {"roast", "deadpan", "mock_respect", "disbelief"}
 
 
 def test_serious_anchor_gets_plain_statement(settings, store, clock):

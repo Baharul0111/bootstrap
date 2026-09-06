@@ -744,5 +744,6 @@ def test_with_api_key_client_is_built_lazily_with_timeout_and_one_retry(settings
 def test_response_models_reason_before_score():
     assert list(_JudgeOut.model_fields)[0] == "reason"
     assert list(_PolicyOut.model_fields)[0] == "reasoning"
-    assert list(_ReplyOut.model_fields)[0] == "reasoning"
-    assert list(_ComposeOut.model_fields) == ["reasoning", "roast", "choice_line", "delivery", "mechanism", "roast_id"]
+    # The two calls on the reply path carry no reasoning field: every output token there is latency.
+    assert "reasoning" not in _ReplyOut.model_fields
+    assert list(_ComposeOut.model_fields) == ["roast", "choice_line", "delivery", "mechanism", "roast_id"]

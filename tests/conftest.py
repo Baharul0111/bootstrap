@@ -21,6 +21,11 @@ def settings(tmp_path) -> Settings:
     s = Settings()
     s.db_path = tmp_path / "anchor.db"
     s.silent = False
+    # Tests exercise the architecture's task-derived pace unless they opt into the fast tempo explicitly.
+    s.patience_s = None
+    s.max_confrontations_per_hour = 4
+    s.roast_cooldown_s = 45
+    s.fresh_start = False        # the resume-across-restarts tests need the spec behaviour
     return s
 
 

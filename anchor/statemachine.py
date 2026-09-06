@@ -83,13 +83,17 @@ def is_jab(text: str) -> bool:
 
 
 def apply_tempo(policy: Policy, settings: Settings) -> Policy:
-    """Demo tempo (ANCHOR_DEMO=1): same policy shape, a third of the patience, quicker pauses.
+    """Fast tempo: same policy shape, a fixed short patience, quicker pauses.
 
-    Applied to the in-memory policy only; the stored policy stays the real one.
+    ``settings.patience_s`` (default 12 s) wins for every task; ``None`` keeps the task-derived patience.
+    ``ANCHOR_DEMO=1`` uses the demo patience. Applied to the in-memory policy only; the stored policy
+    stays the task-derived one, so switching pace never rewrites history.
     """
-    if not getattr(settings, "demo", False):
+    demo = getattr(settings, "demo", False)
+    patience = DEMO_PATIENCE_S if demo else getattr(settings, "patience_s", None)
+    if not patience:
         return policy
-    policy.patience_seconds = DEMO_PATIENCE_S
+    policy.patience_seconds = int(patience)
     policy.pause_idle_s = None if policy.pause_idle_s is None else 2
     policy.pause_stable_s = 3
     policy.tolerance_seconds = 120     # a helper surface (search, AI chat, docs) still counts as the task for 2 min
@@ -207,10 +211,14 @@ class Conversation:
     def start_session(self) -> Optional[Anchor]:
         """Resume the active anchor from disk, or ask for one."""
         pending = self.store.active_anchor()
-        if pending is not None and getattr(self.settings, "demo", False) and pending.detour_until is None:
-            # Demo tempo: every launch starts with the question, so the audience hears the intake.
+        fresh = getattr(self.settings, "fresh_start", False) or (
+            getattr(self.settings, "demo", False) and pending is not None and pending.detour_until is None
+        )
+        if pending is not None and fresh:
+            # Owner's choice: every launch starts with the question. Any pending break is cancelled with it.
+            self.store.set_detour(pending.id, None, None)
             self.store.set_status(pending.id, "retired", self.now())
-            self.store.log_event(pending.id, "RETIRED", "demo launch starts fresh", self.now())
+            self.store.log_event(pending.id, "RETIRED", "launch starts fresh", self.now())
             pending = None
         if pending is not None:
             self.anchor = pending
@@ -392,6 +400,21 @@ class Conversation:
         except Exception:
             return Composition(R.plain_statement(self.anchor, observed, lang), R.choice_line(lang), False)
 
+    def discard_composition(self, comp: Optional[Composition]) -> None:
+        """Forget a line that was composed ahead of time but never spoken, so it neither counts as a recent
+        roast (anti-repeat, model context) nor uses up an approved library line. Never raises."""
+        if comp is None:
+            return
+        try:
+            delivered = getattr(self.composer, "delivered", None)
+            if isinstance(delivered, list) and comp.roast in delivered:
+                del delivered[len(delivered) - 1 - delivered[::-1].index(comp.roast)]   # the most recent copy
+            used = getattr(self.composer, "used_ids", None)
+            if isinstance(used, set) and comp.roast_id:
+                used.discard(comp.roast_id)
+        except Exception:
+            pass
+
     def confront(self, observed: Observed, precomposed: Optional[Composition] = None) -> ConfrontOutcome:
         """Roast + forced choice, ONE optional flat push-back, then accept whatever comes."""
         assert self.anchor is not None and self.policy is not None
@@ -447,11 +470,20 @@ class Conversation:
             spoken: list[str] = []
             if intent.minutes is None:
                 # No amount was given: ask once, then take whatever comes (silence → the default).
+                # The break itself is already agreed, so its default deadline goes to disk BEFORE the question:
+                # a quit or crash mid-answer still ends in a reminder instead of a lost break.
+                default = max(1, int(self.policy.default_detour_minutes))
+                self.anchor.detour_until = self.now() + default * 60
+                self.anchor.detour_minutes = default
+                self.store.set_detour(self.anchor.id, self.anchor.detour_until, default)
                 ask = HOW_LONG_LINE.get(lang, HOW_LONG_LINE["en"])
                 self.say(ask, tone="warm", language=lang)
                 spoken.append(ask)
                 answer = self.hear(language=lang)
-                parsed = H.parse_duration_minutes(answer, self.policy.default_detour_minutes, self.now()) if answer else None
+                parsed = (
+                    H.parse_duration_minutes(answer, self.policy.default_detour_minutes, self.now(), literal=True)
+                    if answer else None
+                )
                 if parsed is None and answer:
                     llm_intent = None
                     try:

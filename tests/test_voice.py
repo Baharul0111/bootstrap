@@ -15,6 +15,7 @@ import pytest
 
 from anchor.config import Settings
 from anchor.voice import (
+    ACCENT_BRIEF,
     HINDI_BRIEF,
     ROAST_DELIVERY,
     TONE_BRIEFS,
@@ -180,9 +181,9 @@ def test_openai_speaker_falls_back_when_audio_device_fails(fake_audio):
             "Speak in clear, natural English with a light Indian conversational cadence.",
             "Speak natural, everyday Hindi (Devanagari text), with a light conversational cadence.")),
         ("warm", "hi", TONE_BRIEFS["warm"] + HINDI_BRIEF),
-        ("flat", "en", TONE_BRIEFS["flat"]),
-        ("mock_respect", "en", TONE_BRIEFS["mock_respect"]),
-        ("disbelief", "en", TONE_BRIEFS["disbelief"]),
+        ("flat", "en", TONE_BRIEFS["flat"] + ACCENT_BRIEF),
+        ("mock_respect", "en", TONE_BRIEFS["mock_respect"] + ACCENT_BRIEF),
+        ("disbelief", "en", TONE_BRIEFS["disbelief"] + ACCENT_BRIEF),
     ],
 )
 def test_openai_speaker_streams_pcm_with_tone_and_language_brief(fake_audio, tone, language, expected_brief):

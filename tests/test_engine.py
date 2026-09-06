@@ -11,6 +11,7 @@ from anchor.sensors import FakeSensor
 from anchor.voice import FakeListener, FakeSpeaker
 from tests.conftest import frame
 
+ROAST_TONES = {"roast", "deadpan", "mock_respect", "disbelief"}   # a joke is spoken with one of these deliveries
 ON = Verdict(drift=0.05, confidence=0.95, reason="editing the assignment", activity="editing the assignment in Word")
 OFF = Verdict(drift=0.95, confidence=0.95, reason="crabs", activity="researching whether crabs can swim on Google")
 AMBIG = Verdict(drift=0.5, confidence=0.4, reason="unclear", activity="")
@@ -61,7 +62,7 @@ def test_single_moment_does_not_trigger_and_return_drains_twice_as_fast(settings
     run(eng, clock, 15)
     assert eng.drift.seconds == 0
     assert eng.conv.state == State.WATCHING
-    assert not any(c[2] == "roast" for c in speaker.calls)
+    assert not any(c[2] in ROAST_TONES for c in speaker.calls)
 
 
 def test_waits_for_a_pause_then_roasts_once(settings, store, clock):
@@ -79,12 +80,12 @@ def test_waits_for_a_pause_then_roasts_once(settings, store, clock):
         clock.advance(1)
         eng.tick()
     assert eng.drift.fired
-    assert not [c for c in speaker.calls if c[2] == "roast"]
+    assert not [c for c in speaker.calls if c[2] in ROAST_TONES]
     assert eng.vision_calls <= (patience + 30) // settings.vision_cooldown_s + 2   # a video is not a new context every second
     # now the user stops typing → natural gap → one confrontation
     sensor.set(idle_s=5.0)
     run(eng, clock, 2)
-    roasts = [c for c in speaker.calls if c[2] == "roast"]
+    roasts = [c for c in speaker.calls if c[2] in ROAST_TONES]
     assert len(roasts) == 1
     assert "crabs" in roasts[0][0].lower()
     assert eng.conv.state == State.DETOUR
@@ -117,20 +118,20 @@ def test_blockers_suppress_speech(settings, store, clock):
     sensor.set(app="Google Chrome", title="crabs can swim? - Google Search", url_domain="google.com", idle_s=9.0, dhash="f" * 16)
     sensor.set_blockers(mic_in_use=True)
     run(eng, clock, patience + 5)
-    assert not any(c[2] == "roast" for c in speaker.calls)
+    assert not any(c[2] in ROAST_TONES for c in speaker.calls)
     sensor.set_blockers(mic_in_use=False, screen_locked=True)
     run(eng, clock, 5)
-    assert not any(c[2] == "roast" for c in speaker.calls)
+    assert not any(c[2] in ROAST_TONES for c in speaker.calls)
     sensor.set_blockers(screen_locked=False, do_not_disturb=True)
     run(eng, clock, 5)
-    assert not any(c[2] == "roast" for c in speaker.calls)
+    assert not any(c[2] in ROAST_TONES for c in speaker.calls)
     eng.set_muted(True)
     sensor.set_blockers(do_not_disturb=False)
     run(eng, clock, 5)
-    assert speaker.calls == [] or not any(c[2] == "roast" for c in speaker.calls)
+    assert speaker.calls == [] or not any(c[2] in ROAST_TONES for c in speaker.calls)
     eng.set_muted(False)
     run(eng, clock, 3)
-    assert len([c for c in speaker.calls if c[2] == "roast"]) == 1
+    assert len([c for c in speaker.calls if c[2] in ROAST_TONES]) == 1
 
 
 def test_vision_only_when_unsure(settings, store, clock):
@@ -186,7 +187,7 @@ def test_expected_surface_is_tolerated_for_a_while(settings, store, clock):
     run(eng, clock, 300)
     assert eng.drift.seconds == 0                                    # within tolerance: part of coding
     run(eng, clock, eng.conv.policy.tolerance_seconds + eng.conv.policy.patience_seconds)
-    assert any(c[2] == "roast" for c in speaker.calls)                # eventually it stops being "part of it"
+    assert any(c[2] in ROAST_TONES for c in speaker.calls)                # eventually it stops being "part of it"
 
 
 def test_wrong_call_writes_refinement_and_flips(settings, store, clock):
@@ -223,7 +224,7 @@ def test_hourly_ceiling_never_more_than_four(settings, store, clock):
             eng.conv.anchor.detour_until = None
             store.set_detour(eng.conv.anchor.id, None)
             eng.conv.state = State.WATCHING
-    roasts = [c for c in speaker.calls if c[2] in ("roast", "warm") and "?" in c[0] and "break" in c[0].lower()]
+    roasts = [c for c in speaker.calls if c[2] in (ROAST_TONES | {"warm"}) and "?" in c[0] and "break" in c[0].lower()]
     assert 1 <= len(roasts) <= 4
 
 
@@ -269,7 +270,7 @@ def test_demo_script_leetcode_then_game(settings, store, clock):
     )
     assert eng.conv.policy.patience_seconds == 10
     run(eng, clock, 60)                                                    # a minute of honest work
-    assert eng.drift.seconds == 0 and not speaker.calls[-1][2] == "roast"
+    assert eng.drift.seconds == 0 and speaker.calls[-1][2] not in ROAST_TONES
     sensor.set(title="New Tab", url_domain="newtab", dhash="b" * 16)       # opening the tab: ambiguous, holds
     run(eng, clock, 2)
     sensor.set(title="Drive Mad - Play online for free! | Poki", url_domain="poki.com", idle_s=0.1, dhash="c" * 16)
@@ -281,7 +282,7 @@ def test_demo_script_leetcode_then_game(settings, store, clock):
         eng.tick()
     assert eng.conv.state == State.DETOUR
     assert 10 <= n <= 20                                                   # hard cap: 2 × patience, no pause needed
-    roast = [c for c in speaker.calls if c[2] == "roast"][0][0]
+    roast = [c for c in speaker.calls if c[2] in ROAST_TONES][0][0]
     assert "drive mad" in roast.lower() or "poki" in roast.lower()
     assert "1 minute" in roast or "minute" in roast.lower()                # names the elapsed time, never "0 minutes"
 
@@ -301,7 +302,7 @@ def test_after_the_break_it_watches_again_and_roasts_if_still_playing(settings, 
     run(eng, clock, 25)
     assert eng.conv.state == State.DETOUR
     assert "How long do you need?" in [t for t, _, _ in speaker.calls]
-    roasts_before = len([c for c in speaker.calls if c[2] == "roast"])
+    roasts_before = len([c for c in speaker.calls if c[2] in ROAST_TONES])
     deadline = eng.conv.anchor.detour_until
     assert deadline == pytest.approx(clock.now() + 120, abs=30)
     while clock.now() < deadline + 1:                                      # the two minutes pass; nothing is judged
@@ -311,7 +312,7 @@ def test_after_the_break_it_watches_again_and_roasts_if_still_playing(settings, 
     assert "solving a DSA question on leetcode" in reminder and speaker.calls[-1][2] == "warm"
     assert eng.conv.state in (State.WATCHING, State.DRIFTING)              # still playing → watched again
     run(eng, clock, 25)
-    assert len([c for c in speaker.calls if c[2] == "roast"]) == roasts_before + 1
+    assert len([c for c in speaker.calls if c[2] in ROAST_TONES]) == roasts_before + 1
     assert eng.conv.state == State.DETOUR
 
 
@@ -350,6 +351,7 @@ def test_going_back_resets_the_timer_and_watches_again(settings, store, clock):
 
 def test_switched_goal_is_held_the_same_way(settings, store, clock):
     settings.demo = True
+    settings.roast_cooldown_s = 0
     GAME = Verdict(drift=0.99, confidence=0.99, reason="poki", activity="playing Drive Mad on poki.com")
     GAME_OK = Verdict(drift=0.02, confidence=0.98, reason="playing, as stated", activity="playing Drive Mad on poki.com")
     LEET_VS_GAME = Verdict(drift=0.95, confidence=0.97, reason="leetcode is not the game", activity="solving Two Sum on leetcode.com")
@@ -366,7 +368,7 @@ def test_switched_goal_is_held_the_same_way(settings, store, clock):
     llm._verdicts = [LEET_VS_GAME] * 5
     sensor.set(title="Two Sum - LeetCode", url_domain="leetcode.com", idle_s=3.0, dhash="e" * 16)
     run(eng, clock, 25)
-    roast = [c for c in speaker.calls if c[2] == "roast"][-1][0].lower()
+    roast = [c for c in speaker.calls if c[2] in ROAST_TONES][-1][0].lower()
     assert "two sum" in roast or "leetcode" in roast
     assert eng.conv.state == State.DETOUR
 
@@ -397,37 +399,33 @@ def test_roast_is_composed_before_the_gap_and_audio_prefetched(settings, store, 
         sensor.set(dhash=("f" * 16) if n % 2 else ("e" * 16))
         clock.advance(1)
         eng.tick()
-    assert eng.drift.fired and not [c for c in speaker.calls if c[2] == "roast"]
+    assert eng.drift.fired and not [c for c in speaker.calls if c[2] in ROAST_TONES]
     assert eng._precomposed is not None                                    # composed while waiting
-    line = [t for t, _, tone in speaker.prefetched if tone == "roast"][-1]
+    line = [t for t, _, tone in speaker.prefetched if tone in ROAST_TONES][-1]
     assert "crabs" in line.lower()
     sensor.set(idle_s=5.0)
     run(eng, clock, 2)
-    roast = [c for c in speaker.calls if c[2] == "roast"][0][0]
+    roast = [c for c in speaker.calls if c[2] in ROAST_TONES][0][0]
     assert roast == line                                                   # the prepared line is the one spoken
     assert eng._precomposed is None
 
 
 def test_cooldown_between_unsolicited_roasts(settings, store, clock):
-    settings.roast_cooldown_s = 45
     eng, sensor, llm, speaker, listener = build(
         settings, store, clock, replies=("finish the assignment tonight", "I will go back to it", "twenty minutes"),
         verdicts=[ON] + [OFF] * 40,
     )
     patience = eng.conv.policy.patience_seconds
+    settings.roast_cooldown_s = patience + 100                            # longer than the patience, to observe it
     run(eng, clock, 1)
     sensor.set(app="Google Chrome", title="r/all", url_domain="reddit.com", idle_s=9, dhash="f" * 16)
     run(eng, clock, patience + 2)
-    first = [c for c in speaker.calls if c[2] in ("roast", "deadpan", "mock_respect", "disbelief")]
-    assert len(first) == 1                                                 # roast → "I will go back" → watching
-    t_first = eng.conv.last_confrontation_ts
+    assert len([c for c in speaker.calls if c[2] in ROAST_TONES]) == 1     # roast → "I will go back" → watching
     run(eng, clock, patience + 2)                                          # still on reddit: fired again...
     assert eng.drift.fired
-    roasts = [c for c in speaker.calls if c[2] in ("roast", "deadpan", "mock_respect", "disbelief")]
-    assert len(roasts) == 1 or eng.conv.last_confrontation_ts - t_first >= 45   # ...but not inside the cooldown
-    run(eng, clock, 45)
-    roasts = [c for c in speaker.calls if c[2] in ("roast", "deadpan", "mock_respect", "disbelief")]
-    assert len(roasts) == 2
+    assert len([c for c in speaker.calls if c[2] in ROAST_TONES]) == 1     # ...but not inside the cooldown
+    run(eng, clock, 100)
+    assert len([c for c in speaker.calls if c[2] in ROAST_TONES]) == 2     # cooldown over → spoken once more
 
 
 def test_demo_settings_from_env(monkeypatch):
@@ -441,8 +439,35 @@ def test_demo_settings_from_env(monkeypatch):
     assert Settings.from_env().default_register == "dry"
     monkeypatch.delenv("ANCHOR_INTENSITY")
     monkeypatch.delenv("ANCHOR_DEMO")
-    s2 = Settings.from_env()
-    assert s2.default_register == "playful" and s2.roast_cooldown_s == 45 and s2.max_confrontations_per_hour == 4
+    s2 = Settings.from_env()                                   # real use: fast pace for every task
+    assert s2.default_register == "playful" and s2.patience_s == 12
+    assert s2.roast_cooldown_s == 20 and s2.max_confrontations_per_hour == 12
+    monkeypatch.setenv("ANCHOR_PACE", "calm")                  # the architecture's minutes-long pace
+    s3 = Settings.from_env()
+    assert s3.patience_s is None and s3.max_confrontations_per_hour == 4 and s3.roast_cooldown_s == 45
+    monkeypatch.delenv("ANCHOR_PACE")
+    monkeypatch.setenv("ANCHOR_PATIENCE_S", "30")
+    assert Settings.from_env().patience_s == 30
+
+
+def test_real_use_pace_calls_a_drift_within_15_seconds(settings, store, clock):
+    settings.patience_s = 12
+    settings.roast_cooldown_s = 20
+    eng, sensor, llm, speaker, _ = build(
+        settings, store, clock, replies=("write my resume for the internship", "twenty minutes"),
+        verdicts=[ON] + [OFF] * 30,
+        start_frame=frame(app="Microsoft Word", title="Resume.docx", domain="", idle=0.5, dhash="a" * 16),
+    )
+    assert eng.conv.policy.patience_seconds == 12
+    assert store.load_policy(eng.conv.anchor.id).patience_seconds == 150   # stored policy stays task-derived
+    run(eng, clock, 30)
+    sensor.set(app="Google Chrome", title="(1) Home / X", url_domain="x.com", idle_s=3.0, dhash="c" * 16)
+    n = 0
+    while eng.conv.state != State.DETOUR and n < 30:
+        n += 1
+        clock.advance(1)
+        eng.tick()
+    assert eng.conv.state == State.DETOUR and n <= 15
 
 
 def test_status_dots(settings, store, clock):

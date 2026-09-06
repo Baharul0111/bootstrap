@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Optional
 
 from dotenv import load_dotenv
 
@@ -48,7 +49,7 @@ def default_db_path() -> Path:
 @dataclass
 class Settings:
     # Fixed product choices (from the owner)
-    voice: str = "cedar"
+    voice: str = "marin"                 # female; the accent comes from the delivery instructions
     default_register: str = "playful"
     default_detour_minutes: int = 15
 
@@ -59,8 +60,11 @@ class Settings:
     stt_model: str = "gpt-4o-mini-transcribe"
 
     # Behaviour constants
-    max_confrontations_per_hour: int = 4
-    roast_cooldown_s: int = 45           # minimum gap between two unsolicited roasts (persona pack default)
+    # Owner's decision (6 Sep 2026): a drift is called 10–15 s after it starts, for every task, in real use —
+    # not the minutes-long task-derived patience of architecture.md. ANCHOR_PACE=calm restores that pace.
+    patience_s: Optional[int] = 12       # None → task-derived patience (coding 240 s, writing 150 s, ...)
+    max_confrontations_per_hour: int = 12
+    roast_cooldown_s: int = 20           # minimum gap between two unsolicited roasts
     cache_ttl_s: int = 1800
     hamming_threshold: int = 12          # dhash bits (of 64) that count as "pixels diverged"
     vision_cooldown_s: int = 60          # at most one forced "look" per context per minute (videos, animations)
@@ -71,7 +75,8 @@ class Settings:
     image_long_edge: int = 768
 
     # Environment switches
-    demo: bool = False                   # ANCHOR_DEMO=1: patience ÷ 3 (min 30 s), quicker pauses — for live demos
+    fresh_start: bool = True             # every launch asks for the goal; ANCHOR_RESUME=1 resumes the last one instead
+    demo: bool = False                   # ANCHOR_DEMO=1: demo patience, no cooldown
     silent: bool = False                 # ANCHOR_SILENT=1 starts muted
     exclude_titles: bool = False         # EXCLUDE_TITLES=1 sends app names only
     profanity_ok: bool = False           # ANCHOR_PROFANITY=1 (default off)
@@ -83,8 +88,15 @@ class Settings:
         s = cls()
         s.demo = _truthy("ANCHOR_DEMO")
         if s.demo:
-            s.max_confrontations_per_hour = 12   # a rehearsal repeats the whole script several times an hour
             s.roast_cooldown_s = 0               # "still playing after the break" must be called within seconds
+        s.fresh_start = not _truthy("ANCHOR_RESUME")
+        pace = os.environ.get("ANCHOR_PACE", "").strip().lower()
+        if pace == "calm":                       # the architecture's task-derived pace and 4/hour ceiling
+            s.patience_s = None
+            s.max_confrontations_per_hour = 4
+            s.roast_cooldown_s = 45
+        elif os.environ.get("ANCHOR_PATIENCE_S", "").strip().isdigit():
+            s.patience_s = max(5, int(os.environ["ANCHOR_PATIENCE_S"]))
         # Persona intensity (playful | pointed | savage) maps onto the register ladder; it is selected, never escalated.
         intensity = os.environ.get("ANCHOR_INTENSITY", "").strip().lower()
         if intensity in INTENSITY_TO_REGISTER:

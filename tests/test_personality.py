@@ -563,8 +563,9 @@ def test_pack_caps_can_only_tighten(p, anchor, observed, policy, settings):
     llm = ResultLLM(default=(GOOD_EN, CHOICE))
     composer = Composer(llm, settings, tighter)
     out = composer.compose(anchor, observed, policy, Register.PLAYFUL, 0, "en")
-    assert llm.calls[0]["word_cap"] == 10
-    assert count_words(out.roast) <= 10 and out.joke_used                 # GOOD_EN (14 words) was refused
+    assert llm.calls[0]["word_cap"] == 10 and len(llm.calls) == 2
+    assert out.roast != GOOD_EN and out.joke_used                         # GOOD_EN (14 words) was refused twice
+    assert validate_roast(out.roast, observed, 0)[0]                      # the last resort keeps the hard 20-word ceiling
     composer.compose(anchor, observed, policy, Register.PLAYFUL, 1, "en")
     assert llm.calls[2]["word_cap"] == 12                                  # never above caps_for()
 

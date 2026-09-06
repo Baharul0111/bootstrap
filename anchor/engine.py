@@ -35,6 +35,8 @@ DOTS = {
     State.DONE: "⚪",
 }
 
+WRONG_CALL_WINDOW_S = 600   # "wrong call" this soon after a roast means the roast, not a later on-task judgement
+
 
 @dataclass
 class EngineStatus:
@@ -45,6 +47,30 @@ class EngineStatus:
     muted: bool
     missing_permissions: list[str] = field(default_factory=list)
     drift_seconds: float = 0.0
+
+
+class Transcript(deque):
+    """The bounded transcript plus a count of every line ever appended and a consistent snapshot.
+
+    A reader on the main thread can tell exactly which lines are new even after the deque has
+    wrapped (30 identical-looking lines are no longer ambiguous), and never trips over
+    "deque mutated during iteration" while the worker is appending.
+    """
+
+    def __init__(self, maxlen: int = 30) -> None:
+        super().__init__(maxlen=maxlen)
+        self.total = 0
+        self._lock = threading.Lock()
+
+    def append(self, line) -> None:
+        with self._lock:
+            super().append(line)
+            self.total += 1
+
+    def snapshot(self) -> tuple[list, int]:
+        """(lines, total ever appended) read atomically."""
+        with self._lock:
+            return list(self), self.total
 
 
 class Engine:
@@ -58,7 +84,8 @@ class Engine:
         self.conv = Conversation(
             settings, store, llm, speaker, listener, self.clock, is_muted=lambda: self._muted
         )
-        self.transcript: deque[str] = self.conv.transcript
+        self.transcript: Transcript = Transcript(maxlen=30)
+        self.conv.transcript = self.transcript    # one counted, lock-protected deque shared by both
         self.gate = ChangeGate(settings.hamming_threshold)
         self.drift: Optional[DriftAccumulator] = None
         self.pause: Optional[PauseGate] = None
@@ -81,6 +108,9 @@ class Engine:
         self._vision_at: dict[str, float] = {}
         self._precomposed: Optional[tuple[str, object]] = None
         self._precompose_thread: Optional[threading.Thread] = None
+        self._precompose_gen = 0                       # bumped whenever a prepared line becomes stale
+        self._confronted: Optional[tuple[str, Verdict, float]] = None   # (fingerprint, verdict, when) of the last roast
+        self._detour_blocked_by = ""                   # why a due reminder is waiting; logged once per reason
         self.precompose_async = True
 
     # ------------------------------------------------------------------ lifecycle
@@ -91,9 +121,14 @@ class Engine:
         self._thread.start()
 
     def stop(self) -> None:
+        """Ask the worker to finish and wait up to 3 s. Never raises, even from the worker thread itself."""
         self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=3.0)
+        thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            try:
+                thread.join(timeout=3.0)
+            except RuntimeError:
+                pass
 
     def run_forever(self) -> None:
         try:
@@ -135,12 +170,15 @@ class Engine:
         self.drift_started_at = None
         self.last_verdict = None
         self.last_fingerprint = ""
+        self._confronted = None
+        self._drop_precomposed()
 
     # ------------------------------------------------------------------ status / controls
     def status(self) -> EngineStatus:
         with self._lock:
             state = self.conv.state
             anchor = self.conv.anchor
+            drift = self.drift          # the worker may swap this for None mid-call; read it once
             dot = "🔇" if self._muted else DOTS.get(state, "⚪")
             return EngineStatus(
                 state=state,
@@ -149,7 +187,7 @@ class Engine:
                 anchor_text=anchor.verbatim if anchor else "",
                 muted=self._muted,
                 missing_permissions=list(self.missing_permissions),
-                drift_seconds=self.drift.seconds if self.drift else 0.0,
+                drift_seconds=drift.seconds if drift is not None else 0.0,
             )
 
     @property
@@ -165,12 +203,18 @@ class Engine:
         return self._muted
 
     def wrong_call(self) -> None:
-        """The user says the last judgement was wrong: record it, flip it, and forget the build-up."""
+        """The user says the last call was wrong: record it, flip it, and forget the build-up.
+
+        "The last call" is the roast when there was one recently and everything judged since is on-task
+        (they went back to work before reaching the menu); otherwise it is the latest judgement."""
         with self._lock:
             anchor = self.conv.anchor
             fp = self.last_fingerprint
             v = self.last_verdict
             now = self.clock.now()
+            roasted, self._confronted = self._confronted, None
+            if roasted is not None and (v is None or not v.off_task) and now - roasted[2] <= WRONG_CALL_WINDOW_S:
+                fp, v = roasted[0], roasted[1]
             if anchor is None or not fp or v is None:
                 self.store.add_refinement(anchor.id if anchor else None, "", "The user flagged the last call as wrong.", now)
                 self.transcript.append("you: wrong call (nothing to correct yet)")
@@ -187,10 +231,13 @@ class Engine:
                 source="refinement", activity=v.activity,
             )
             self.store.put_verdict(anchor.id, fp, flipped, self.last_frame.dhash if self.last_frame else "", now)
-            self.last_verdict = flipped
-            if v.off_task and self.drift is not None:
-                self.drift.reset()
+            if fp == self.last_fingerprint:
+                self.last_verdict = flipped
+            drift = self.drift          # read once: the worker may replace it while we hold the lock
+            if v.off_task and drift is not None:
+                drift.reset()
                 self.drift_started_at = None
+                self._drop_precomposed()
             self.transcript.append(f"you: wrong call → now treating '{fp.split('|')[0]}' as {should}")
 
     # ------------------------------------------------------------------ the loop body
@@ -203,7 +250,20 @@ class Engine:
         conv = self.conv
 
         if conv.state == State.DETOUR:
-            # Fully paused: no sensing, no judging, no cost. Only the absolute deadline is compared.
+            # Fully paused: no sensing, no judging, no cost. Only the absolute deadline is compared — and once it
+            # is due, the reminder waits like any other speech for a call, Focus, a locked screen or Mute to end
+            # (it then says how late it is).
+            due = conv.anchor is not None and conv.anchor.detour_until is not None and now >= conv.anchor.detour_until
+            if due:
+                waiting: Blockers = self.sensor.blockers()
+                waiting.muted = self._muted
+                if not may_speak(waiting):
+                    reason = blocker_reason(waiting)
+                    if reason != self._detour_blocked_by:
+                        self._detour_blocked_by = reason
+                        self.store.log_event(conv.anchor.id, "SUPPRESSED", f"reminder waiting: {reason}", now)
+                    return
+            self._detour_blocked_by = ""
             if conv.check_detour(now):
                 self._rebuild_for_policy()
             return
@@ -250,12 +310,14 @@ class Engine:
             self.drift_started_at = now
         elif self.drift.seconds == 0:
             self.drift_started_at = None
+            self._drop_precomposed()                   # they came back before the gap: a prepared line is stale
 
         ready = self.pause.update(frame, decision, self.drift.seconds, dt_s)
         conv.state = State.DRIFTING if self.drift.seconds > 0 else State.WATCHING
 
-        if self.drift.fired and not ready:
-            self._precompose(frame, decision.fingerprint, verdict, now)   # have the line ready before the gap
+        halfway = self.drift.seconds >= 0.5 * self.conv.policy.patience_seconds
+        if (self.drift.fired or halfway) and verdict is not None and verdict.off_task and not verdict.tolerated:
+            self._precompose(frame, decision.fingerprint, verdict, now)   # have the line (and its audio) ready early
         if not self.drift.fired or not ready:
             return
 
@@ -274,12 +336,13 @@ class Engine:
 
         observed = self._observed(frame, verdict, now)
         precomposed = self._take_precomposed(decision.fingerprint)
+        with self._lock:
+            self._confronted = (decision.fingerprint, verdict, now) if verdict is not None else None
         outcome = conv.confront(observed, precomposed=precomposed)
         self.drift.reset()
         self.pause.reset()
         self.drift_started_at = None
-        with self._lock:
-            self._precomposed = None
+        self._drop_precomposed()                       # anything still in flight was for the episode that just ended
         if outcome.intent.value in ("SWITCH", "DONE"):
             self._rebuild_for_policy()
 
@@ -301,6 +364,7 @@ class Engine:
                 return
             observed = self._observed(frame, verdict, now)
             conv = self.conv
+            gen = self._precompose_gen
 
             def work() -> None:
                 try:
@@ -308,7 +372,12 @@ class Engine:
                 except Exception:
                     return
                 with self._lock:
-                    self._precomposed = (fingerprint, comp)
+                    fresh = gen == self._precompose_gen
+                    if fresh:
+                        self._precomposed = (fingerprint, comp)
+                if not fresh:
+                    conv.discard_composition(comp)     # the episode ended while composing: never speak this
+                    return
                 speaker = conv.speaker
                 if hasattr(speaker, "prefetch") and not conv.muted:
                     try:
@@ -332,7 +401,17 @@ class Engine:
             self._precomposed = None
         if item is not None and item[0] == fingerprint:
             return item[1]
+        if item is not None:
+            self.conv.discard_composition(item[1])     # prepared for a context they have since left
         return None
+
+    def _drop_precomposed(self) -> None:
+        """Forget any prepared line, held or still in flight: the episode it was written for is over."""
+        with self._lock:
+            self._precompose_gen += 1
+            item, self._precomposed = self._precomposed, None
+        if item is not None:
+            self.conv.discard_composition(item[1])
 
     # ------------------------------------------------------------------ judging
     def judge_context(self, frame: ContextFrame, decision: GateDecision, now: float) -> Verdict:

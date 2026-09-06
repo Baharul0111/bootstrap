@@ -384,7 +384,11 @@ class MacSensor:
     # ---- browser URL ------------------------------------------------------ #
 
     def _url_domain(self, bundle_id: str) -> str:
-        """Hostname of the front tab for known browsers; "" otherwise or on failure."""
+        """Hostname of the front tab for known browsers; "" otherwise or on failure.
+
+        ``EXCLUDE_TITLES=1`` means app-name-only: the browser is never asked for its URL either."""
+        if self.settings.exclude_titles:
+            return ""
         expr = BROWSER_URL_SCRIPTS.get(bundle_id or "")
         if not expr:
             return ""
@@ -419,12 +423,11 @@ class MacSensor:
 
     def _screen_hash(self) -> tuple[str, bool]:
         """(dhash hex, screen_available). Stores the PIL image on self._last_image."""
+        self._last_image = None   # dropped first, so a capture that raises can never leave a stale frame behind
         if not MAC_AVAILABLE or not IMAGING_AVAILABLE or not _screen_capture_allowed():
-            self._last_image = None
             return "", False
         image = self._capture()
         if image is None:
-            self._last_image = None
             return "", False
         self._last_image = image
         row, _col = dhash.dhash_row_col(image, size=8)

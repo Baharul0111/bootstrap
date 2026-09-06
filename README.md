@@ -77,7 +77,11 @@ is locked, or a Focus mode is on.
 
 | Variable | Effect |
 |----------|--------|
-| `ANCHOR_DEMO=1` | demo tempo: asks for the goal on every launch, 10 s of patience, 2 s idle / 3 s still-screen pauses, so a drift is called 10–20 s after it starts |
+| (default) | real use: every launch starts by asking for the goal (a previous goal or break is dropped); 12 s of patience for every task (a drift is called 10–15 s after it starts, 24 s at most while you keep typing), 20 s cooldown, 12 interruptions an hour at most |
+| `ANCHOR_RESUME=1` | resume the previous goal and any pending break across a quit, sleep or lid-close (the original spec behaviour) |
+| `ANCHOR_DEMO=1` | demo tempo: asks for the goal on every launch, 10 s of patience, no cooldown |
+| `ANCHOR_PATIENCE_S=30` | any other patience in seconds |
+| `ANCHOR_PACE=calm` | the architecture's original pace: minutes of patience derived from the task (coding 4 min, writing 2.5, lecture 7), 4 interruptions an hour, 45 s cooldown |
 | `ANCHOR_INTENSITY=playful\|pointed\|savage` | Booty Globlin intensity (selected, never escalated). Default `pointed`, which is the `playful` register on the ladder; irritation only ever cools it |
 | `ANCHOR_PERSONALITY=path` | use another personality JSON instead of `personality/booty_globlin.json` |
 | `ANCHOR_SILENT=1` | start muted |
@@ -85,7 +89,7 @@ is locked, or a Focus mode is on.
 | `EXCLUDE_TITLES=1` | send app names only, never window titles |
 | `ANCHOR_DB=path` | put the database somewhere else |
 | `ANCHOR_PROFANITY=1` | allow mild profanity in roasts (default off) |
-| `ANCHOR_VOICE=name` | override the TTS voice (default `cedar`) |
+| `ANCHOR_VOICE=name` | override the TTS voice (default `marin`, a female voice; `sage` and `coral` are the other two auditioned). The Indian-English accent comes from the delivery instructions, not the voice |
 | `ANCHOR_ENV=path` | load a different `.env` file |
 
 ## Development

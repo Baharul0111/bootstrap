@@ -59,7 +59,19 @@ class TranscriptTail:
         self.printed = 0
 
     def drain(self, transcript: Any) -> list[str]:
-        current = [str(line) for line in (transcript or ())]
+        snapshot = getattr(transcript, "snapshot", None)
+        if callable(snapshot):
+            # The engine's transcript counts every line ever appended: exact, even after the wrap.
+            lines, total = snapshot()
+            current = [str(line) for line in lines]
+            fresh = min(len(current), max(0, total - self.printed))   # more than maxlen new: the oldest are gone
+            self._last = current
+            self.printed = total
+            return current[len(current) - fresh:] if fresh else []
+        try:
+            current = [str(line) for line in (transcript or ())]
+        except RuntimeError:            # a plain deque appended to mid-iteration: pick it up on the next tick
+            return []
         prev = self._last
         if current[: len(prev)] == prev:
             new = current[len(prev):]

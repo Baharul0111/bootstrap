@@ -238,12 +238,21 @@ def _minutes_until(hour: int, minute: int, now: float, explicit_period: bool) ->
     return max(1, int(math.ceil((target.timestamp() - now) / 60)))
 
 
-def parse_duration_minutes(text: str, default_minutes: int, now: Optional[float] = None) -> Optional[int]:
-    """Minutes implied by free-form text, ``default_minutes`` for vague phrasing, None when nothing is there."""
+def parse_duration_minutes(
+    text: str, default_minutes: int, now: Optional[float] = None, literal: bool = False
+) -> Optional[int]:
+    """Minutes implied by free-form text, ``default_minutes`` for vague phrasing, None when nothing is there.
+
+    ``literal=True`` is for the answer to "How long do you need?": there, "a minute" means one minute.
+    """
     low = (text or "").lower().strip()
     if not low:
         return None
     now = time.time() if now is None else now
+    if literal:                                   # "five" as the answer to "How long?" means five minutes
+        bare = _num(low.strip(" .!,"))
+        if bare is not None:
+            return max(1, int(round(bare)))
 
     # --- explicit clock times: "till nine", "until 9:30 pm", "by 10", "9 baje tak", "sade nau tak", "नौ बजे तक"
     m = re.search(
@@ -291,10 +300,11 @@ def parse_duration_minutes(text: str, default_minutes: int, now: Optional[float]
             extra = 30 if "and a half" in m.group(0) else 0
             return max(1, int(round(n * 60 + extra)))
 
-    # --- "a minute" is a figure of speech, not sixty seconds
-    for phrase in ("just a minute", "a minute", "one minute", "ek minute", "एक मिनट", "a sec", "one sec"):
-        if phrase in low:
-            return max(1, int(default_minutes))
+    # --- "a minute" is a figure of speech, not sixty seconds ("one minute" is literal; so is any answer to "How long?")
+    if not literal:
+        for phrase in ("just a minute", "a minute", "a sec", "one sec"):
+            if phrase in low:
+                return max(1, int(default_minutes))
 
     # --- minutes
     m = re.search(_NUMTOK + r"\s*(?:more\s+)?(minutes?|mins?|मिनट)", low) or \
