@@ -11,11 +11,13 @@ Run: .venv/bin/python -m pytest tests/test_roast_safety.py -q
 from __future__ import annotations
 
 import re
+from dataclasses import replace
 
 import pytest
 
 from anchor.config import Settings
 from anchor.models import Anchor, Composition, Observed, Policy, Register
+from anchor.personality import Personality, load_personality
 from anchor import roast as R
 from anchor.roast import (
     BANNED,
@@ -63,11 +65,16 @@ class ScriptedLLM:
         self.calls: list[dict] = []
 
     def compose(self, anchor, observed, policy, register, repeat_index, language,
-                word_cap, sentence_cap, profanity_ok=False):
+                word_cap, sentence_cap, profanity_ok=False, *, intensity="pointed",
+                persona_prompt="", eligible_lines=None, recent_roasts=None,
+                tease_material="", exclusions=""):
         self.calls.append(dict(anchor=anchor, observed=observed, policy=policy,
                                register=register, repeat_index=repeat_index,
                                language=language, word_cap=word_cap,
-                               sentence_cap=sentence_cap, profanity_ok=profanity_ok))
+                               sentence_cap=sentence_cap, profanity_ok=profanity_ok,
+                               intensity=intensity, persona_prompt=persona_prompt,
+                               eligible_lines=eligible_lines, recent_roasts=recent_roasts,
+                               tease_material=tease_material, exclusions=exclusions))
         if not self.script:
             return self.default
         item = self.script.pop(0)
@@ -124,7 +131,15 @@ def settings() -> Settings:
     return Settings()
 
 
-GOOD_EN = "Still researching crabs on Google, 12 minutes in — the report is holding its breath."
+@pytest.fixture
+def no_library() -> Personality:
+    """The persona with its approved library removed. With the library present
+    the Composer's fallback is an approved punchline (tests/test_personality.py);
+    the tests below pin the templated fallback, so they take the library away."""
+    return replace(load_personality(), library=[])
+
+
+GOOD_EN ="Still researching crabs on Google, 12 minutes in — the report is holding its breath."
 GOOD_HI = "12 मिनट से Google पर crabs की रिसर्च चल रही है, रिपोर्ट इंतज़ार में है।"
 CHOICE_EN = "Short break, or is this the new main thing?"
 
@@ -190,9 +205,9 @@ def test_banned_hi_rejected_with_category_in_reason(category, en_term, hi_term, 
 
 @pytest.mark.parametrize("category,en_term,hi_term", CATEGORY_EXAMPLES)
 def test_composer_regenerates_once_then_falls_back_en(category, en_term, hi_term,
-                                                      anchor, observed, policy, settings):
+                                                      anchor, observed, policy, settings, no_library):
     llm = ScriptedLLM([(bad_en(en_term), CHOICE_EN), (bad_en(en_term), CHOICE_EN)])
-    out = Composer(llm, settings).compose(anchor, observed, policy, Register.PLAYFUL, 0, "en")
+    out = Composer(llm, settings, no_library).compose(anchor, observed, policy, Register.PLAYFUL, 0, "en")
     assert isinstance(out, Composition)
     assert len(llm.calls) == 2                       # regenerate exactly once
     assert find_banned(out.roast) == []
@@ -313,15 +328,15 @@ def test_dry_repeat_no_joke_but_dry_first_time_allowed(anchor, observed, policy,
 # Repeat decay and never-escalate
 # ---------------------------------------------------------------------------
 
-def test_repeat_decay_with_overlong_llm(anchor, observed, policy, settings):
+def test_repeat_decay_with_overlong_llm(anchor, observed, policy, settings, no_library):
     long_line = ("Honestly the crabs on Google have now had twelve minutes of your undivided "
                  "attention while the quarterly report sits there wondering what it did wrong "
                  "to deserve this kind of treatment today.")
-    assert count_words(long_line) > 30
+    assert count_words(long_line) > 20
     llm = ScriptedLLM(default=(long_line, CHOICE_EN))
     counts = []
     for idx in range(4):
-        out = Composer(llm, settings).compose(anchor, observed, policy, Register.PLAYFUL, idx, "en")
+        out = Composer(llm, settings, no_library).compose(anchor, observed, policy, Register.PLAYFUL, idx, "en")
         assert out.joke_used is True
         sents, words = caps_for(idx)
         assert count_sentences(out.roast) <= sents
@@ -331,7 +346,7 @@ def test_repeat_decay_with_overlong_llm(anchor, observed, policy, settings):
     assert counts == sorted(counts, reverse=True)      # strictly non-increasing
     assert counts[3] <= 8
     assert len(llm.calls) == 8                          # two tries per confrontation, no more
-    assert [c["word_cap"] for c in llm.calls] == [30, 30, 16, 16, 8, 8, 8, 8]
+    assert [c["word_cap"] for c in llm.calls] == [20, 20, 12, 12, 8, 8, 8, 8]
     assert [c["sentence_cap"] for c in llm.calls] == [2, 2, 1, 1, 1, 1, 1, 1]
 
 
@@ -340,8 +355,8 @@ def test_caps_never_escalate():
     for earlier, later in zip(caps, caps[1:]):
         assert later[0] <= earlier[0]
         assert later[1] <= earlier[1]
-    assert caps[0] == (2, 30) and caps[1] == (1, 16) and caps[2] == (1, 8)
-    assert caps_for(-3) == (2, 30)
+    assert caps[0] == (2, 20) and caps[1] == (1, 12) and caps[2] == (1, 8)
+    assert caps_for(-3) == (2, 20)
 
 
 # ---------------------------------------------------------------------------
@@ -445,7 +460,7 @@ def test_composer_passes_language_and_caps_to_llm(anchor, observed_hi, policy, s
     assert out.roast == GOOD_HI and out.joke_used
     call = llm.calls[0]
     assert call["language"] == "hi" and call["register"] == Register.PLAYFUL
-    assert call["repeat_index"] == 0 and (call["sentence_cap"], call["word_cap"]) == (2, 30)
+    assert call["repeat_index"] == 0 and (call["sentence_cap"], call["word_cap"]) == (2, 20)
 
 
 # ---------------------------------------------------------------------------
@@ -602,9 +617,9 @@ def test_register_ladder_never_climbs_back():
 # Composer never raises
 # ---------------------------------------------------------------------------
 
-def test_composer_never_raises_when_llm_raises(anchor, observed, policy, settings):
+def test_composer_never_raises_when_llm_raises(anchor, observed, policy, settings, no_library):
     llm = ScriptedLLM([RuntimeError("boom"), ValueError("still boom")])
-    out = Composer(llm, settings).compose(anchor, observed, policy, Register.PLAYFUL, 0, "en")
+    out = Composer(llm, settings, no_library).compose(anchor, observed, policy, Register.PLAYFUL, 0, "en")
     assert isinstance(out, Composition)
     assert len(llm.calls) == 2
     assert out.joke_used is True

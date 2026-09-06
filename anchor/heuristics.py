@@ -16,6 +16,7 @@ from typing import Optional
 from .models import ContextFrame, Intent, Policy, PolicyDraft, Register, ReplyIntent, Sentiment, Verdict
 
 DEVANAGARI = re.compile(r"[ऀ-ॿ]")
+ARABIC_SCRIPT = re.compile(r"[؀-ۿݐ-ݿ]")   # spoken Hindi sometimes transcribes as Urdu script
 _WORD = re.compile(r"[a-zA-Zऀ-ॿ][\w'ऀ-ॿ]*")
 
 HINGLISH_WORDS = {
@@ -105,8 +106,8 @@ _NUMTOK = _L + r"(" + _COMPOUND + r"|" + _NUM[1:-1] + r")" + _R
 
 VAGUE_DURATION = [
     "a bit", "a while", "some time", "sometime", "a few minutes", "few minutes", "a little", "a moment", "a sec",
-    "later", "thoda der", "thodi der", "thodi si der", "kuch der", "baad mein", "baad me", "थोड़ी देर", "थोड़ा",
-    "कुछ देर", "बाद में", "थोड़ी", "ek minute", "एक मिनट", "a minute", "one minute", "just a minute",
+    "later", "thoda der", "thodi der", "thodi si der", "kuch der", "baad mein", "baad me", "थोड़ी देर", "थोड़ा समय",
+    "कुछ देर", "बाद में", "ek minute", "एक मिनट", "a minute", "one minute", "just a minute",
 ]
 
 DISTRACTION_DOMAINS = [
@@ -130,7 +131,7 @@ def _tokens(text: str) -> list[str]:
 
 
 def detect_language(text: str) -> str:
-    if DEVANAGARI.search(text or ""):
+    if DEVANAGARI.search(text or "") or ARABIC_SCRIPT.search(text or ""):
         return "hi"
     toks = _tokens(text)
     if not toks:
@@ -322,6 +323,13 @@ SWITCH_PHRASES = [
 DEFER_WORDS = ["break", "later", "remind", "few minutes", "minutes", "minute", "give me", "wait", "thoda", "thodi",
                "baad", "break lena", "बाद में", "ब्रेक", "रुको", "hold on", "pause", "some time", "a bit", "मिनट",
                "देर", "after"]
+RESUME_PHRASES = [
+    "going back", "go back", "get back to", "getting back", "back to it", "back to work", "back to the", "i'll stop",
+    "i will stop", "stopping now", "resume", "returning", "let me get back", "on it", "okay okay", "ok ok",
+    "fine, i'll", "fine i'll", "alright, i'll", "yes i am", "yes i'm", "i'm back", "im back", "wapas", "वापस",
+    "haan ja raha", "ja raha hoon", "ja rahi hoon", "जा रहा हूँ", "जा रही हूँ", "ठीक है, जाता हूँ", "chalo wapas",
+]
+AFFIRMATIVES = {"yes", "yeah", "yep", "yup", "sure", "okay", "ok", "haan", "ha", "हाँ", "हां", "theek hai", "ठीक है"}
 EVASIVE_FILLERS = ["hmm", "hm", "uh", "um", "whatever", "leave me", "idk", "kya", "not sure", "pata nahi",
                    "dunno", "meh", "eh", "huh", "what"]
 IRRITATED_WORDS = ["stop", "shut up", "annoying", "leave me alone", "go away", "ugh", "seriously", "chup",
@@ -369,9 +377,13 @@ def classify_reply_keywords(text: str, default_minutes: int, now: Optional[float
     if any(p in low for p in SWITCH_PHRASES):
         return ReplyIntent(Intent.SWITCH, new_anchor=_extract_new_anchor(raw), sentiment=sentiment, language=language)
     minutes = parse_duration_minutes(raw, default_minutes, now)
-    if minutes is not None or any(w in low for w in DEFER_WORDS):
-        return ReplyIntent(Intent.DEFER, minutes=minutes or max(1, int(default_minutes)), sentiment=sentiment,
-                           language=language)
+    if minutes is not None:
+        return ReplyIntent(Intent.DEFER, minutes=minutes, sentiment=sentiment, language=language)
+    stripped = low.strip(" .!,")
+    if any(p in low for p in RESUME_PHRASES) or stripped in AFFIRMATIVES:
+        return ReplyIntent(Intent.RESUME, sentiment=sentiment, language=language)
+    if any(w in low for w in DEFER_WORDS):
+        return ReplyIntent(Intent.DEFER, minutes=max(1, int(default_minutes)), sentiment=sentiment, language=language)
     return ReplyIntent(Intent.EVASIVE, sentiment=sentiment, language=language)
 
 

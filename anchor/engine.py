@@ -79,6 +79,9 @@ class Engine:
         self.vision_calls = 0
         self.cache_hits = 0
         self._vision_at: dict[str, float] = {}
+        self._precomposed: Optional[tuple[str, object]] = None
+        self._precompose_thread: Optional[threading.Thread] = None
+        self.precompose_async = True
 
     # ------------------------------------------------------------------ lifecycle
     def start(self) -> None:
@@ -251,6 +254,8 @@ class Engine:
         ready = self.pause.update(frame, decision, self.drift.seconds, dt_s)
         conv.state = State.DRIFTING if self.drift.seconds > 0 else State.WATCHING
 
+        if self.drift.fired and not ready:
+            self._precompose(frame, decision.fingerprint, verdict, now)   # have the line ready before the gap
         if not self.drift.fired or not ready:
             return
 
@@ -263,19 +268,71 @@ class Engine:
             self.store.log_event(conv.anchor.id, "CEILING", "4 per hour reached", now)
             self.drift.drain(self.settings.tick_s * 60)   # cool down instead of retrying every second
             return
+        last = conv.last_confrontation_ts
+        if last is not None and now - last < self.settings.roast_cooldown_s:
+            return                                          # one unsolicited roast per episode, then a cooldown
 
-        minutes = max(1, int(math.ceil(max(0.0, now - (self.drift_started_at or now)) / 60)))
-        activity = (verdict.activity if verdict and verdict.activity else "") or H.describe_activity(frame)
-        observed = Observed(
-            activity=activity, app=frame.app, title=frame.title, url_domain=frame.url_domain,
-            minutes_off_task=minutes, confidence=verdict.confidence if verdict else 0.5,
-        )
-        outcome = conv.confront(observed)
+        observed = self._observed(frame, verdict, now)
+        precomposed = self._take_precomposed(decision.fingerprint)
+        outcome = conv.confront(observed, precomposed=precomposed)
         self.drift.reset()
         self.pause.reset()
         self.drift_started_at = None
+        with self._lock:
+            self._precomposed = None
         if outcome.intent.value in ("SWITCH", "DONE"):
             self._rebuild_for_policy()
+
+    # ------------------------------------------------------------------ speaking ahead of the gap
+    def _observed(self, frame: ContextFrame, verdict: Optional[Verdict], now: float) -> Observed:
+        minutes = max(1, int(math.ceil(max(0.0, now - (self.drift_started_at or now)) / 60)))
+        activity = (verdict.activity if verdict and verdict.activity else "") or H.describe_activity(frame)
+        return Observed(
+            activity=activity, app=frame.app, title=frame.title, url_domain=frame.url_domain,
+            minutes_off_task=minutes, confidence=verdict.confidence if verdict else 0.5,
+        )
+
+    def _precompose(self, frame: ContextFrame, fingerprint: str, verdict: Optional[Verdict], now: float) -> None:
+        """Compose the roast (and synthesize its audio) while we wait for a natural pause, so the gap is not wasted."""
+        with self._lock:
+            if self._precomposed is not None and self._precomposed[0] == fingerprint:
+                return
+            if self._precompose_thread is not None and self._precompose_thread.is_alive():
+                return
+            observed = self._observed(frame, verdict, now)
+            conv = self.conv
+
+            def work() -> None:
+                try:
+                    comp = conv.compose_for(observed)
+                except Exception:
+                    return
+                with self._lock:
+                    self._precomposed = (fingerprint, comp)
+                speaker = conv.speaker
+                if hasattr(speaker, "prefetch") and not conv.muted:
+                    try:
+                        speaker.prefetch(f"{comp.roast} {comp.choice_line}".strip(), language=conv.language(),
+                                         tone="roast" if comp.joke_used else "warm")
+                    except Exception:
+                        pass
+
+            if self.precompose_async:
+                self._precompose_thread = threading.Thread(target=work, name="anchor-precompose", daemon=True)
+                self._precompose_thread.start()
+            else:
+                work()
+
+    def _take_precomposed(self, fingerprint: str):
+        t = self._precompose_thread
+        if t is not None and t.is_alive():
+            t.join(timeout=3.0)
+        with self._lock:
+            item = self._precomposed
+            self._precomposed = None
+        if item is not None and item[0] == fingerprint:
+            return item[1]
+        return None
 
     # ------------------------------------------------------------------ judging
     def judge_context(self, frame: ContextFrame, decision: GateDecision, now: float) -> Verdict:
@@ -322,6 +379,8 @@ class Engine:
             verdict = H.judge_heuristic(anchor.clarified or anchor.verbatim, policy, frame)
         if not verdict.activity:
             verdict.activity = H.describe_activity(frame)
+        if verdict.drift <= 0.05:
+            verdict.tolerated = False      # this IS the task, not a helper surface: it must drain, never expire
         self.store.put_verdict(anchor.id, fp, verdict, frame.dhash, now)
         self.store.log_event(anchor.id, "VERDICT", f"{fp} drift={verdict.drift:.2f} conf={verdict.confidence:.2f} {verdict.source}", now)
         return verdict

@@ -286,6 +286,165 @@ def test_demo_script_leetcode_then_game(settings, store, clock):
     assert "1 minute" in roast or "minute" in roast.lower()                # names the elapsed time, never "0 minutes"
 
 
+def test_after_the_break_it_watches_again_and_roasts_if_still_playing(settings, store, clock):
+    settings.demo = True
+    GAME = Verdict(drift=0.99, confidence=0.99, reason="poki", activity="playing Drive Mad on poki.com")
+    LEET = Verdict(drift=0.03, confidence=0.98, reason="leetcode", activity="solving Two Sum on leetcode.com")
+    eng, sensor, llm, speaker, listener = build(
+        settings, store, clock,
+        replies=("solving a DSA question on leetcode", "I just need a short break", "two minutes", "", "twenty minutes"),
+        verdicts=[LEET] + [GAME] * 30,
+        start_frame=frame(app="Google Chrome", title="Two Sum - LeetCode", domain="leetcode.com", idle=0.5, dhash="a" * 16),
+    )
+    run(eng, clock, 5)
+    sensor.set(title="Drive Mad - Play online for free! | Poki", url_domain="poki.com", idle_s=3.0, dhash="c" * 16)
+    run(eng, clock, 25)
+    assert eng.conv.state == State.DETOUR
+    assert "How long do you need?" in [t for t, _, _ in speaker.calls]
+    roasts_before = len([c for c in speaker.calls if c[2] == "roast"])
+    deadline = eng.conv.anchor.detour_until
+    assert deadline == pytest.approx(clock.now() + 120, abs=30)
+    while clock.now() < deadline + 1:                                      # the two minutes pass; nothing is judged
+        clock.advance(1)
+        eng.tick()
+    reminder = speaker.calls[-1][0]
+    assert "solving a DSA question on leetcode" in reminder and speaker.calls[-1][2] == "warm"
+    assert eng.conv.state in (State.WATCHING, State.DRIFTING)              # still playing → watched again
+    run(eng, clock, 25)
+    assert len([c for c in speaker.calls if c[2] == "roast"]) == roasts_before + 1
+    assert eng.conv.state == State.DETOUR
+
+
+def test_going_back_resets_the_timer_and_watches_again(settings, store, clock):
+    settings.demo = True
+    GAME = Verdict(drift=0.99, confidence=0.99, reason="poki", activity="playing Drive Mad on poki.com")
+    LEET = Verdict(drift=0.03, confidence=0.98, reason="leetcode", activity="solving Two Sum on leetcode.com")
+    eng, sensor, llm, speaker, listener = build(
+        settings, store, clock,
+        replies=("solving a DSA question on leetcode", "I will go back to LeetCode.", "twenty minutes"),
+        verdicts=[LEET] + [GAME] * 30,
+        start_frame=frame(app="Google Chrome", title="Two Sum - LeetCode", domain="leetcode.com", idle=0.5, dhash="a" * 16),
+    )
+    run(eng, clock, 3)
+    sensor.set(title="Drive Mad - Play online for free! | Poki", url_domain="poki.com", idle_s=3.0, dhash="c" * 16)
+    for _ in range(30):                                                    # until the first confrontation resolves
+        clock.advance(1)
+        eng.tick()
+        if any(t == "Okay." for t, _, _ in speaker.calls):
+            break
+    assert eng.conv.state in (State.WATCHING, State.DRIFTING) and eng.conv.anchor.detour_until is None
+    assert eng.drift.seconds == 0                                          # the build-up is forgiven on "I'll go back"
+    assert not [c for c in speaker.calls if c[2] == "flat"]                # no push-back for a real answer
+    # they actually go back: nothing more is said
+    sensor.set(title="Two Sum - LeetCode", url_domain="leetcode.com", dhash="a" * 16)
+    llm._verdicts = [LEET] * 5
+    n = len(speaker.calls)
+    run(eng, clock, 60)
+    assert len(speaker.calls) == n and eng.conv.state == State.WATCHING
+    # they said they'd go back but kept playing: caught again after the patience
+    sensor.set(title="Drive Mad - Play online for free! | Poki", url_domain="poki.com", idle_s=3.0, dhash="c" * 16)
+    llm._verdicts = [GAME] * 5
+    run(eng, clock, 25)
+    assert eng.conv.state == State.DETOUR
+
+
+def test_switched_goal_is_held_the_same_way(settings, store, clock):
+    settings.demo = True
+    GAME = Verdict(drift=0.99, confidence=0.99, reason="poki", activity="playing Drive Mad on poki.com")
+    GAME_OK = Verdict(drift=0.02, confidence=0.98, reason="playing, as stated", activity="playing Drive Mad on poki.com")
+    LEET_VS_GAME = Verdict(drift=0.95, confidence=0.97, reason="leetcode is not the game", activity="solving Two Sum on leetcode.com")
+    eng, sensor, llm, speaker, listener = build(
+        settings, store, clock,
+        replies=("solving a DSA question on leetcode", "this is the new main thing, I'm playing games now", "twenty minutes"),
+        verdicts=[Verdict(0.03, 0.98, "leetcode", activity="solving Two Sum"), GAME] + [GAME_OK] * 5,
+        start_frame=frame(app="Google Chrome", title="Two Sum - LeetCode", domain="leetcode.com", idle=0.5, dhash="a" * 16),
+    )
+    run(eng, clock, 3)
+    sensor.set(title="Drive Mad - Play online for free! | Poki", url_domain="poki.com", idle_s=3.0, dhash="c" * 16)
+    run(eng, clock, 25)
+    assert "playing games" in eng.conv.anchor.verbatim and eng.conv.state in (State.WATCHING, State.DRIFTING)
+    llm._verdicts = [LEET_VS_GAME] * 5
+    sensor.set(title="Two Sum - LeetCode", url_domain="leetcode.com", idle_s=3.0, dhash="e" * 16)
+    run(eng, clock, 25)
+    roast = [c for c in speaker.calls if c[2] == "roast"][-1][0].lower()
+    assert "two sum" in roast or "leetcode" in roast
+    assert eng.conv.state == State.DETOUR
+
+
+def test_roast_is_composed_before_the_gap_and_audio_prefetched(settings, store, clock):
+    class PrefetchSpeaker(FakeSpeaker):
+        def __init__(self):
+            super().__init__()
+            self.prefetched = []
+
+        def prefetch(self, text, *, language="en", tone="neutral"):
+            self.prefetched.append((text, language, tone))
+            return True
+
+    sensor = FakeSensor([frame(app="Microsoft Word", title="assignment.docx", domain="", dhash="0" * 16)])
+    llm = FakeLLM(verdicts=[ON, OFF] + [OFF] * 30)
+    speaker, listener = PrefetchSpeaker(), FakeListener(["finish the assignment tonight", "twenty minutes"])
+    eng = Engine(settings, store, sensor, llm, speaker, listener, clock)
+    eng.precompose_async = False
+    eng.startup()
+    assert any(t == "You said: finish the assignment tonight. Still true?" for t, _, _ in speaker.prefetched)
+    patience = eng.conv.policy.patience_seconds
+    run(eng, clock, 1)
+    sensor.set(app="Google Chrome", title="crabs can swim? - Google Search", url_domain="google.com", idle_s=0.2, dhash="f" * 16)
+    n = 0
+    for _ in range(patience + 5):                                          # typing the whole time: no gap yet
+        n += 1
+        sensor.set(dhash=("f" * 16) if n % 2 else ("e" * 16))
+        clock.advance(1)
+        eng.tick()
+    assert eng.drift.fired and not [c for c in speaker.calls if c[2] == "roast"]
+    assert eng._precomposed is not None                                    # composed while waiting
+    line = [t for t, _, tone in speaker.prefetched if tone == "roast"][-1]
+    assert "crabs" in line.lower()
+    sensor.set(idle_s=5.0)
+    run(eng, clock, 2)
+    roast = [c for c in speaker.calls if c[2] == "roast"][0][0]
+    assert roast == line                                                   # the prepared line is the one spoken
+    assert eng._precomposed is None
+
+
+def test_cooldown_between_unsolicited_roasts(settings, store, clock):
+    settings.roast_cooldown_s = 45
+    eng, sensor, llm, speaker, listener = build(
+        settings, store, clock, replies=("finish the assignment tonight", "I will go back to it", "twenty minutes"),
+        verdicts=[ON] + [OFF] * 40,
+    )
+    patience = eng.conv.policy.patience_seconds
+    run(eng, clock, 1)
+    sensor.set(app="Google Chrome", title="r/all", url_domain="reddit.com", idle_s=9, dhash="f" * 16)
+    run(eng, clock, patience + 2)
+    first = [c for c in speaker.calls if c[2] in ("roast", "deadpan", "mock_respect", "disbelief")]
+    assert len(first) == 1                                                 # roast → "I will go back" → watching
+    t_first = eng.conv.last_confrontation_ts
+    run(eng, clock, patience + 2)                                          # still on reddit: fired again...
+    assert eng.drift.fired
+    roasts = [c for c in speaker.calls if c[2] in ("roast", "deadpan", "mock_respect", "disbelief")]
+    assert len(roasts) == 1 or eng.conv.last_confrontation_ts - t_first >= 45   # ...but not inside the cooldown
+    run(eng, clock, 45)
+    roasts = [c for c in speaker.calls if c[2] in ("roast", "deadpan", "mock_respect", "disbelief")]
+    assert len(roasts) == 2
+
+
+def test_demo_settings_from_env(monkeypatch):
+    from anchor.config import Settings
+    monkeypatch.setenv("ANCHOR_DEMO", "1")
+    monkeypatch.setenv("ANCHOR_INTENSITY", "savage")
+    s = Settings.from_env()
+    assert s.demo and s.roast_cooldown_s == 0 and s.max_confrontations_per_hour == 12
+    assert s.default_register == "spicy"
+    monkeypatch.setenv("ANCHOR_INTENSITY", "playful")
+    assert Settings.from_env().default_register == "dry"
+    monkeypatch.delenv("ANCHOR_INTENSITY")
+    monkeypatch.delenv("ANCHOR_DEMO")
+    s2 = Settings.from_env()
+    assert s2.default_register == "playful" and s2.roast_cooldown_s == 45 and s2.max_confrontations_per_hour == 4
+
+
 def test_status_dots(settings, store, clock):
     eng, sensor, llm, speaker, _ = build(settings, store, clock, verdicts=[ON, OFF])
     run(eng, clock, 1)

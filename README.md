@@ -78,7 +78,10 @@ is locked, or a Focus mode is on.
 | Variable | Effect |
 |----------|--------|
 | `ANCHOR_DEMO=1` | demo tempo: asks for the goal on every launch, 10 s of patience, 2 s idle / 3 s still-screen pauses, so a drift is called 10–20 s after it starts |
+| `ANCHOR_INTENSITY=playful\|pointed\|savage` | Booty Globlin intensity (selected, never escalated). Default `pointed`, which is the `playful` register on the ladder; irritation only ever cools it |
+| `ANCHOR_PERSONALITY=path` | use another personality JSON instead of `personality/booty_globlin.json` |
 | `ANCHOR_SILENT=1` | start muted |
+| `ANCHOR_REPLY_FILE=path` | replace the microphone with a text file: each line appended to it is one spoken reply (used by `tools/drive_desktop.py`, which opens real sites and apps on this Mac and checks every response end to end) |
 | `EXCLUDE_TITLES=1` | send app names only, never window titles |
 | `ANCHOR_DB=path` | put the database somewhere else |
 | `ANCHOR_PROFANITY=1` | allow mild profanity in roasts (default off) |
@@ -95,3 +98,24 @@ is locked, or a Focus mode is on.
 
 The menu-bar shell is `anchor/app.py`; `anchor/engine.py` owns the worker thread where every
 network and audio call happens — the main thread only ever reads a status snapshot.
+
+## Personality: Booty Globlin (Team Bootstrap)
+
+The voice is **Booty Globlin**: a tiny, excessively confident work companion. Everything about the character
+lives in one editable file, `personality/booty_globlin.json`:
+
+- `system_prompt` — the persona the roast-writing model is given (from `personality/booty_globlin_personality.md`).
+- `library` — the ten creator-approved lines R01–R10 with the conditions under which each may be used. An approved
+  line is used verbatim as the punchline after a short grounded premise ("One minute into Drive Mad on Poki.
+  You're the minimum in MVP."), because the first roast of a goal must name the actual activity and the elapsed time.
+  A line is never delivered twice in a session; lines whose facts are unknown (paid plans, imposter syndrome) stay unused.
+- `intensity_by_register`, `word_caps`, `sentence_caps` — how sharp and how short. Intensity is chosen with
+  `ANCHOR_INTENSITY`; it is never raised by the number of distractions, and an irritated reply cools it for the day.
+- `comebacks`, `stop_words`, `jab_words` — "you're just a bot" gets one short comeback and then the question stands;
+  "stop" / "shut up" / "chup" ends the exchange immediately with no farewell joke.
+- `delivery_briefs` — deadpan / mock_respect / disbelief, sent to the speech model as performance direction, never spoken.
+- `fixtures` — demo presets (intensity, teasing material, exclusions, known facts). Labelled as fixtures; they are not evidence.
+
+The hard safety gates stay outside the personality file and cannot be edited away: never about the person, the
+banned topics, no joke on serious goals or on low confidence, one push-back only, and the 45-second cooldown
+between unsolicited roasts (0 in demo mode). Hindi goals get native Hindi lines; the English library is not translated.

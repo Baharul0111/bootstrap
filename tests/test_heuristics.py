@@ -151,6 +151,23 @@ def test_classify_defer(text, minutes):
     assert r.intent == Intent.DEFER and r.minutes == minutes
 
 
+@pytest.mark.parametrize("text", [
+    "I will go back to LeetCode.", "going back to it", "okay okay", "yes", "Yeah.", "haan", "fine, I'll stop",
+    "wapas ja raha hoon", "मैं वापस जा रहा हूँ", "let me get back to work",
+])
+def test_classify_resume(text):
+    assert H.classify_reply_keywords(text, 15, NOW_1432).intent == Intent.RESUME
+
+
+def test_resume_with_amount_is_defer():
+    r = H.classify_reply_keywords("I'll be back in ten minutes", 15, NOW_1432)
+    assert r.intent == Intent.DEFER and r.minutes == 10
+
+
+def test_urdu_script_counts_as_hindi():
+    assert H.detect_language("ایک شارٹ بریک") == "hi"
+
+
 @pytest.mark.parametrize("text", ["", "   ", "hmm", "whatever", "idk", "kya", "not sure", "pata nahi", "the weather is nice"])
 def test_classify_evasive(text):
     assert H.classify_reply_keywords(text, 15, NOW_1432).intent == Intent.EVASIVE

@@ -6,14 +6,22 @@ This module does no network I/O. It receives an ``llm`` object with a
 ``compose(...)`` method and only ever calls that; everything else here is pure
 text: banned-term lists, validators, caps, native English/Hindi templates, the
 ``Composer`` (gates -> generate -> validate -> regenerate once -> fall back) and
-the ``RegisterLadder`` (which can only ever cool, never warm).
+the ``RegisterLadder`` (which can only ever cool, never warm). The ``Composer``
+also carries a ``Personality`` (``personality.py``): the Booty Globlin brief
+handed to the model, and the ten creator-approved lines with the conditions
+under which each may be used. Every line, library or fresh, goes through the
+same validator.
 
 Safety properties enforced here (architecture.md, Component 8; goal.md 13-18):
 - Banned entirely: appearance, intelligence, discipline-as-character-flaw,
   relationships, family, money, weight, profanity (profanity opt-in via config).
 - A roast must name the actual activity and (first two times) the elapsed time.
-- Caps: confrontation 1 -> 2 sentences / 30 words, 2 -> 1 / 16, 3+ -> 1 / 8.
+  A library line may be the punchline after a grounded premise on the first
+  confrontation, and may stand alone from the second confrontation on.
+- Caps: confrontation 1 -> 2 sentences / 20 words, 2 -> 1 / 12, 3+ -> 1 / 8.
   Caps never escalate.
+- No exact repeat and no near-duplicate punchline (same last six words) in a
+  session; each library line is spoken at most once per session.
 - Four gates suppress the joke entirely: serious anchor, low confidence,
   cooled-to-dry on a repeat, mute.
 - The push-back and the detour reminder never carry a joke.
@@ -22,10 +30,21 @@ Safety properties enforced here (architecture.md, Component 8; goal.md 13-18):
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from typing import Any, Optional
 
 from .config import Settings
-from .models import Anchor, Composition, Observed, Policy, Register, cool_register
+from .models import Anchor, ComposeResult, Composition, Observed, Policy, Register, cool_register
+from .personality import (
+    DELIVERIES,
+    LibraryLine,
+    Personality,
+    caps_for_index,
+    context_flags,
+    eligible_lines,
+    intensity_for,
+    load_personality,
+)
 
 __all__ = [
     "BANNED",
@@ -50,6 +69,7 @@ __all__ = [
     "couldnt_hear",
     "switch_ack",
     "accept_line",
+    "comeback_line",
     "Composer",
     "RegisterLadder",
 ]
@@ -245,14 +265,14 @@ def find_banned(text: str, profanity_ok: bool = False) -> list[tuple[str, str]]:
 def caps_for(repeat_index: int) -> tuple[int, int]:
     """(max_sentences, max_words) for the n-th confrontation on the same anchor.
 
-    0 -> (2, 30); 1 -> (1, 16); 2+ -> (1, 8). Monotonically non-increasing:
+    0 -> (2, 20); 1 -> (1, 12); 2+ -> (1, 8). Monotonically non-increasing:
     the joke only ever gets shorter, never sharper or longer.
     """
     idx = max(0, int(repeat_index or 0))
     if idx == 0:
-        return (2, 30)
+        return (2, 20)
     if idx == 1:
-        return (1, 16)
+        return (1, 12)
     return (1, 8)
 
 
@@ -405,11 +425,22 @@ def _lang(language: Optional[str]) -> str:
     return "hi" if (language or "").strip().lower().startswith("hi") else "en"
 
 
+_TRAILING_FUNCTION_WORDS = {
+    "on", "in", "at", "to", "of", "the", "a", "an", "and", "or", "for", "with", "about", "into",
+    "from", "by", "है", "का", "की", "के", "पर", "में", "से", "और", "या",
+}
+
+
 def _clip_words(text: str, limit: int, ellipsis: str = "") -> str:
+    """First ``limit`` words; a clipped phrase never ends on a dangling
+    preposition/article ("crabs can swim on" -> "crabs can swim")."""
     toks = (text or "").split()
     if len(toks) <= limit:
         return " ".join(toks)
-    return " ".join(toks[:limit]) + ellipsis
+    kept = toks[:limit]
+    while len(kept) > 1 and _EDGE_PUNCT_RE.sub("", kept[-1]).lower() in _TRAILING_FUNCTION_WORDS:
+        kept.pop()
+    return " ".join(kept) + ellipsis
 
 
 def _strip_end_punct(text: str) -> str:
@@ -422,12 +453,12 @@ def _anchor_text(anchor: Anchor) -> str:
 
 
 def _anchor_quote(anchor: Anchor, profanity_ok: bool) -> Optional[str]:
-    """A <= 6 word quote of the anchor for the fallback roast, or None when the
+    """A <= 4 word quote of the anchor for the fallback roast, or None when the
     quote itself would carry a banned term (the joke must not repeat it)."""
     raw = _strip_end_punct(getattr(anchor, "verbatim", "") or getattr(anchor, "clarified", "") or "")
     if not raw:
         return None
-    snippet = _clip_words(raw, 6, "…")
+    snippet = _clip_words(raw, 4, "…")
     if find_banned(snippet, profanity_ok=profanity_ok):
         return None
     return snippet
@@ -455,24 +486,25 @@ def _minutes(observed: Observed) -> int:
 def fallback_roast(
     anchor: Anchor, observed: Observed, repeat_index: int, language: str, profanity_ok: bool = False
 ) -> str:
-    """Templated roast used when the model's line fails twice. Names the activity
-    and the minutes, stays inside caps_for(repeat_index), and avoids banned terms
-    (the anchor quote is dropped if it contains one)."""
+    """Templated roast used when the model's line fails twice and no approved
+    library line fits. Names the activity and the minutes, stays inside
+    caps_for(repeat_index) (2/20, 1/12, 1/8), and avoids banned terms (the
+    anchor quote is dropped if it contains one)."""
     lang = _lang(language)
     idx = max(0, int(repeat_index or 0))
     m = _minutes(observed)
     if idx == 0:
-        act = _subject(observed, profanity_ok, 9 if lang == "en" else 8)
+        act = _subject(observed, profanity_ok, 7)
         quote = _anchor_quote(anchor, profanity_ok)
         if lang == "hi":
             if quote:
-                return f"{m} मिनट पहले आप '{quote}' कहने वाले इंसान थे। अब {act} चल रहा है — ज़बरदस्त मोड़।"
-            return f"{m} मिनट पहले आपने कुछ और कहा था। अब {act} चल रहा है — ज़बरदस्त मोड़।"
+                return f"{m} मिनट पहले बात थी '{quote}'। अब {act} — ज़बरदस्त मोड़।"
+            return f"{m} मिनट पहले कुछ और कहा था। अब {act} — ज़बरदस्त मोड़।"
         if quote:
-            return f"{m} minutes ago you were a person who said '{quote}'. Now it's {act} — bold pivot."
+            return f"{m} minutes ago it was '{quote}'. Now it's {act} — bold pivot."
         return f"{m} minutes ago you said one thing. Now it's {act} — bold pivot."
     if idx == 1:
-        act = _subject(observed, profanity_ok, 9 if lang == "en" else 8)
+        act = _subject(observed, profanity_ok, 8 if lang == "en" else 6)
         if lang == "hi":
             return f"अब भी {act}, {m} मिनट हो गए।"
         return f"Still {act}, {m} minutes in."
@@ -588,20 +620,109 @@ def accept_line(language: str) -> str:
     return "Okay."
 
 
+def comeback_line(personality: Personality, used: set[str]) -> str:
+    """The persona's answer when the person roasts the bot ("you're just a
+    bot"): the first comeback not yet spoken this session, which is recorded
+    into ``used`` so it is never repeated. "" when they are exhausted — then
+    the bot simply yields. A comeback carrying a banned term is skipped."""
+    for line in getattr(personality, "comebacks", None) or []:
+        text = (line or "").strip()
+        if text and text not in used and not find_banned(text):
+            used.add(text)
+            return text
+    return ""
+
+
 # ---------------------------------------------------------------------------
 # 4. Composer: gates -> generate -> validate -> regenerate once -> fall back
 # ---------------------------------------------------------------------------
 
 _MIN_CONFIDENCE = 0.75
 _CHOICE_MAX_WORDS = 20
+_RECENT_ROASTS = 10          # how many earlier roasts the model is shown
+_TAIL_WORDS = 6              # "same punchline" = same last six words
+_PREMISE_MAX_WORDS = 8       # the grounded clause before a library punchline
+
+_QUOTE_MAP = str.maketrans({"’": "'", "‘": "'", "“": '"', "”": '"'})
+
+
+def _plain_quotes(text: str) -> str:
+    """Curly quotes -> straight, same length, so a library line still matches
+    when the model straightened its apostrophe."""
+    return (text or "").translate(_QUOTE_MAP)
+
+
+def _tail(text: str) -> tuple[str, ...]:
+    toks = [t.casefold() for t in _tokens(_plain_quotes(text))]
+    return tuple(toks[-_TAIL_WORDS:])
+
+
+def _short_subject(observed: Observed, profanity_ok: bool, limit: int) -> str:
+    """A short name for what is on screen: the activity when it is already
+    short, else the site ("Poki" from "poki.com"), else the app, else the
+    activity clipped."""
+    act = _strip_end_punct(observed.activity or "")
+    if act and count_words(act) <= limit and not find_banned(act, profanity_ok=profanity_ok):
+        return act
+    domain = (observed.url_domain or "").strip().lower()
+    labels = [part for part in domain.split(".") if part and part != "www"]
+    if len(labels) >= 2:
+        site = labels[-2]
+        if len(site) >= 4 and not find_banned(site, profanity_ok=profanity_ok):
+            return site[:1].upper() + site[1:]
+    return _subject(observed, profanity_ok, limit)
+
+
+def _as_compose_result(result: Any) -> Optional[ComposeResult]:
+    """Normalise what ``llm.compose`` returned: a ``ComposeResult``, a
+    ``(roast, choice)`` tuple from an older wrapper, or junk (-> None)."""
+    if isinstance(result, ComposeResult):
+        out = result
+    elif isinstance(result, (tuple, list)) and len(result) == 2:
+        out = ComposeResult(roast=result[0], choice_line=result[1])
+    elif not isinstance(result, (str, bytes)) and hasattr(result, "roast") and hasattr(result, "choice_line"):
+        out = ComposeResult(
+            roast=getattr(result, "roast"),
+            choice_line=getattr(result, "choice_line"),
+            delivery=getattr(result, "delivery", "deadpan"),
+            mechanism=getattr(result, "mechanism", None),
+            roast_id=getattr(result, "roast_id", None),
+        )
+    else:
+        return None
+    if not isinstance(out.roast, str):
+        return None
+    choice = out.choice_line if isinstance(out.choice_line, str) else ""
+    delivery = out.delivery if isinstance(out.delivery, str) and out.delivery in DELIVERIES else "deadpan"
+    mechanism = out.mechanism.strip() if isinstance(out.mechanism, str) and out.mechanism.strip() else None
+    roast_id = out.roast_id.strip() if isinstance(out.roast_id, str) and out.roast_id.strip() else None
+    return ComposeResult(roast=out.roast, choice_line=choice, delivery=delivery, mechanism=mechanism, roast_id=roast_id)
+
+
+@dataclass
+class _Pick:
+    """A roast that passed every check, with what the speech path needs to know."""
+
+    roast: str
+    roast_id: Optional[str] = None
+    mechanism: Optional[str] = None
+    delivery: str = "deadpan"
+    choice: str = ""
 
 
 class Composer:
-    """Turns an anchor + observation into what gets spoken. Never raises."""
+    """Turns an anchor + observation into what gets spoken. Never raises.
 
-    def __init__(self, llm: Any, settings: Settings):
+    ``delivered`` is every roast spoken this session (exact text), for the
+    anti-repeat check and the model's "recent roasts" context; ``used_ids`` the
+    library lines already spoken (each at most once per session)."""
+
+    def __init__(self, llm: Any, settings: Settings, personality: Optional[Personality] = None):
         self.llm = llm
         self.settings = settings
+        self.personality: Personality = personality if personality is not None else load_personality()
+        self.delivered: list[str] = []
+        self.used_ids: set[str] = set()
 
     @property
     def _profanity_ok(self) -> bool:
@@ -665,31 +786,53 @@ class Composer:
             return Composition(plain_statement(anchor, observed, lang), template_choice, False)
 
         # --- Joke allowed: generate, validate, regenerate once, fall back. ---
-        sentence_cap, word_cap = caps_for(idx)
+        p = self.personality
         profanity_ok = self._profanity_ok
-        roast: Optional[str] = None
-        choice = template_choice
+        intensity = intensity_for(reg, p)
+        anchor_text = getattr(anchor, "clarified", "") or getattr(anchor, "verbatim", "") or ""
+        flags = context_flags(anchor_text, observed, p.facts)
+        # The library is English-only; a Hindi anchor keeps its native Hindi roast.
+        eligible: list[LibraryLine] = [] if lang == "hi" else eligible_lines(p, intensity, flags, self.used_ids)
+        sentence_cap, word_cap = self._caps(idx)
+
+        pick: Optional[_Pick] = None
         for _attempt in range(2):
-            result = self._call_llm(anchor, observed, policy, reg, idx, lang, word_cap, sentence_cap, profanity_ok)
+            result = self._call_llm(
+                anchor, observed, policy, reg, idx, lang, word_cap, sentence_cap, profanity_ok, intensity, eligible
+            )
             if result is None:
                 continue
-            candidate, candidate_choice = result
-            ok, _reason = validate_roast(candidate, observed, idx, profanity_ok=profanity_ok)
-            if ok:
-                roast = candidate.strip()
-                if self._choice_acceptable(candidate_choice, profanity_ok):
-                    choice = candidate_choice.strip()
+            pick = self._accept(result, observed, idx, eligible, profanity_ok, sentence_cap, word_cap)
+            if pick is not None:
                 break
 
-        if roast is None:
+        if pick is None:
+            pick = self._library_fallback(observed, idx, lang, eligible, profanity_ok, sentence_cap, word_cap)
+        if pick is None:
             candidate = fallback_roast(anchor, observed, idx, lang, profanity_ok=profanity_ok)
             ok, _reason = validate_roast(candidate, observed, idx, profanity_ok=profanity_ok)
             if not ok:
                 # The observation itself carries something the joke must not repeat.
                 return Composition(plain_statement(anchor, observed, lang), template_choice, False)
-            roast = candidate
+            pick = _Pick(candidate)
 
-        return Composition(roast, choice, True)
+        self.delivered.append(pick.roast)
+        if pick.roast_id:
+            self.used_ids.add(pick.roast_id)
+        choice = pick.choice.strip() if self._choice_acceptable(pick.choice, profanity_ok) else template_choice
+        return Composition(
+            pick.roast, choice, True, delivery=pick.delivery, roast_id=pick.roast_id, mechanism=pick.mechanism
+        )
+
+    def _caps(self, idx: int) -> tuple[int, int]:
+        """``caps_for(idx)``, tightened (never loosened) by the pack's own caps."""
+        sentences, words = caps_for(idx)
+        try:
+            pack_sentences, pack_words = caps_for_index(self.personality, idx)
+            sentences, words = min(sentences, pack_sentences), min(words, pack_words)
+        except Exception:
+            pass
+        return sentences, words
 
     def _call_llm(
         self,
@@ -702,30 +845,46 @@ class Composer:
         word_cap: int,
         sentence_cap: int,
         profanity_ok: bool,
-    ) -> Optional[tuple[str, str]]:
-        """One guarded call to ``llm.compose``. Any exception or malformed result -> None."""
+        intensity: str,
+        eligible: list[LibraryLine],
+    ) -> Optional[ComposeResult]:
+        """One guarded call to ``llm.compose``. Any exception or malformed result -> None.
+
+        Passes the persona (brief, intensity, eligible library lines, recent
+        roasts, demo tease material and exclusions). A wrapper that predates
+        those keywords is called again with the legacy signature; an older
+        ``(roast, choice)`` tuple result is normalised to a ``ComposeResult``."""
+        fixtures = self.personality.fixtures or {}
+        exclusions = fixtures.get("exclusions") or []
+        base = dict(
+            anchor=anchor,
+            observed=observed,
+            policy=policy,
+            register=register,
+            repeat_index=repeat_index,
+            language=language,
+            word_cap=word_cap,
+            sentence_cap=sentence_cap,
+            profanity_ok=profanity_ok,
+        )
+        persona = dict(
+            intensity=intensity,
+            persona_prompt=self.personality.system_prompt,
+            eligible_lines=[(line.id, line.text) for line in eligible],
+            recent_roasts=list(self.delivered[-_RECENT_ROASTS:]),
+            tease_material=str(fixtures.get("tease_material") or ""),
+            exclusions=", ".join(str(x) for x in exclusions),
+        )
         try:
-            result = self.llm.compose(
-                anchor=anchor,
-                observed=observed,
-                policy=policy,
-                register=register,
-                repeat_index=repeat_index,
-                language=language,
-                word_cap=word_cap,
-                sentence_cap=sentence_cap,
-                profanity_ok=profanity_ok,
-            )
+            try:
+                result = self.llm.compose(**base, **persona)
+            except TypeError as exc:
+                if "unexpected keyword" not in str(exc):
+                    return None
+                result = self.llm.compose(**base)
         except Exception:
             return None
-        if not isinstance(result, (tuple, list)) or len(result) != 2:
-            return None
-        roast, choice = result
-        if not isinstance(roast, str):
-            return None
-        if not isinstance(choice, str):
-            choice = ""
-        return roast, choice
+        return _as_compose_result(result)
 
     @staticmethod
     def _choice_acceptable(line: str, profanity_ok: bool) -> bool:
@@ -735,6 +894,133 @@ class Composer:
         if count_words(line) > _CHOICE_MAX_WORDS:
             return False
         return not find_banned(line, profanity_ok=profanity_ok)
+
+    # -- validation of what the model returned ------------------------------
+
+    def _accept(
+        self,
+        result: ComposeResult,
+        observed: Observed,
+        idx: int,
+        eligible: list[LibraryLine],
+        profanity_ok: bool,
+        sentence_cap: int,
+        word_cap: int,
+    ) -> Optional[_Pick]:
+        """Every gate a model line must pass, else None: non-empty, no banned
+        term, within caps, not a repeat, no used/ineligible library line inside
+        it, and specific (activity + time on the first confrontation; from the
+        second on, a verbatim library punchline may stand alone)."""
+        text = (result.roast or "").strip()
+        if not text:
+            return None
+        if find_banned(text, profanity_ok=profanity_ok):
+            return None
+        if count_sentences(text) > sentence_cap or count_words(text) > word_cap:
+            return None
+        if self._repeats(text):
+            return None
+        line, ok = self._library_match(text, eligible)
+        if not ok:
+            return None
+        if line is not None:
+            text = self._canonical(text, line)
+        roast_id = line.id if line is not None else None
+        if (idx == 0 or roast_id is None) and not is_specific(text, observed, idx):
+            return None
+        mechanism = result.mechanism or (line.mechanism if line is not None else None)
+        return _Pick(text, roast_id, mechanism, result.delivery, result.choice_line)
+
+    def _repeats(self, text: str) -> bool:
+        """Exact repeat, or the same last six words, as anything spoken this session."""
+        key = _plain_quotes(text).strip().casefold()
+        tail = _tail(text)
+        for prev in self.delivered:
+            if _plain_quotes(prev).strip().casefold() == key:
+                return True
+            if tail and tail == _tail(prev):
+                return True
+        return False
+
+    def _library_match(self, text: str, eligible: list[LibraryLine]) -> tuple[Optional[LibraryLine], bool]:
+        """(line, ok). ``line`` is the eligible, unused library line that appears
+        verbatim inside ``text`` (quote style aside), else None. ``ok`` is False
+        when the text carries a library line that is used or not eligible now:
+        the model's roast_id claim is never trusted over the text itself."""
+        plain = _plain_quotes(text)
+        eligible_ids = {line.id for line in eligible}
+        found: Optional[LibraryLine] = None
+        for line in self.personality.library:
+            needle = _plain_quotes(line.text)
+            if needle.casefold() not in plain.casefold():
+                continue
+            if line.id in self.used_ids or line.id not in eligible_ids:
+                return None, False
+            if found is None and needle in plain:
+                found = line
+        return found, True
+
+    @staticmethod
+    def _canonical(text: str, line: LibraryLine) -> str:
+        """``text`` with the library line restored to its exact pack wording."""
+        plain = _plain_quotes(text)
+        needle = _plain_quotes(line.text)
+        i = plain.find(needle)
+        if i < 0:
+            return text
+        return text[:i] + line.text + text[i + len(needle):]
+
+    # -- deterministic fallback: an eligible approved line -------------------
+
+    def _library_fallback(
+        self,
+        observed: Observed,
+        idx: int,
+        lang: str,
+        eligible: list[LibraryLine],
+        profanity_ok: bool,
+        sentence_cap: int,
+        word_cap: int,
+    ) -> Optional[_Pick]:
+        """The first eligible line that passes every check: after a grounded
+        premise naming the minutes and the activity on the first two
+        confrontations, bare from the third. None when no line fits."""
+        if lang == "hi" or not eligible:
+            return None
+        premises = [] if idx >= 2 else self._premises(observed, idx, profanity_ok)
+        for line in eligible:
+            if find_banned(line.text, profanity_ok=profanity_ok):
+                continue                      # the validator outranks the library
+            candidates = [line.text] if idx >= 2 else [f"{premise} {line.text}" for premise in premises]
+            for cand in candidates:
+                if self._repeats(cand):
+                    continue
+                if count_sentences(cand) > sentence_cap or count_words(cand) > word_cap:
+                    continue
+                if idx <= 1:
+                    if not validate_roast(cand, observed, idx, profanity_ok=profanity_ok)[0]:
+                        continue
+                elif find_banned(cand, profanity_ok=profanity_ok):
+                    continue
+                return _Pick(cand, line.id, line.mechanism)
+        return None
+
+    @staticmethod
+    def _premises(observed: Observed, idx: int, profanity_ok: bool) -> list[str]:
+        """Grounded clauses (<= 8 words) to put before a library punchline, e.g.
+        "One minute into playing Drive Mad on Poki." for the first confrontation
+        and "Poki, 12 minutes in —" for the second. Two joinings are offered
+        because a two-sentence line only fits the caps after a dash."""
+        m = _minutes(observed)
+        if idx == 0:
+            head = "Under a minute into" if m == 0 else "One minute into" if m == 1 else f"{m} minutes into"
+            act = _subject(observed, profanity_ok, _PREMISE_MAX_WORDS - count_words(head))
+            clause = f"{head} {act}".strip()
+        else:
+            subject = _short_subject(observed, profanity_ok, 3)
+            when = "under a minute in" if m == 0 else "one minute in" if m == 1 else f"{m} minutes in"
+            clause = f"{subject[:1].upper()}{subject[1:]}, {when}"
+        return [f"{clause}.", f"{clause} —"]
 
 
 # ---------------------------------------------------------------------------

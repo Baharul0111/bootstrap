@@ -126,6 +126,123 @@ def test_roast_then_choice_then_defer(settings, store, clock):
     assert "20" in out.spoken[-1]                  # repeats the amount back
 
 
+def test_break_without_amount_asks_how_long_once(settings, store, clock):
+    conv, speaker, listener = anchored(settings, store, clock, replies=["I just need a short break", "two minutes"])
+    out = conv.confront(observed())
+    assert out.intent == Intent.DEFER and out.minutes == 2
+    spoken = [t for t, _, _ in speaker.calls]
+    assert spoken.count("How long do you need?") == 1
+    assert "2" in spoken[-1]                                     # repeats the amount back
+    assert conv.anchor.detour_until == pytest.approx(clock.now() + 120)
+    assert out.pushed is False                                   # asking "how long" is not the push-back
+
+
+def test_break_without_amount_and_silence_takes_default(settings, store, clock):
+    conv, speaker, listener = anchored(settings, store, clock, replies=["I need a break", ""])
+    out = conv.confront(observed())
+    assert out.intent == Intent.DEFER and out.minutes == 15
+    assert [t for t, _, _ in speaker.calls].count("How long do you need?") == 1
+    assert len(listener.calls) == 3                              # intake, reply, one how-long answer — no loop
+
+
+def test_vague_amount_does_not_ask(settings, store, clock):
+    conv, speaker, _ = anchored(settings, store, clock, replies=["give me a bit"])
+    out = conv.confront(observed())
+    assert out.intent == Intent.DEFER and out.minutes == 15
+    assert "How long do you need?" not in [t for t, _, _ in speaker.calls]
+
+
+def test_break_how_long_in_hindi(settings, store, clock):
+    conv, speaker, _ = anchored(settings, store, clock, sentence="मुझे आज रात असाइनमेंट खत्म करना है", replies=["थोड़ा ब्रेक चाहिए", "दो मिनट"])
+    out = conv.confront(observed())
+    assert out.intent == Intent.DEFER and out.minutes == 2
+    assert "कितना समय चाहिए?" in [t for t, _, _ in speaker.calls]
+
+
+@pytest.mark.parametrize("reply", ["I will go back to LeetCode.", "okay okay", "yes", "fine, I'll stop", "haan wapas ja raha hoon"])
+def test_going_back_is_accepted_without_pushback(settings, store, clock, reply):
+    conv, speaker, listener = anchored(settings, store, clock, replies=[reply])
+    out = conv.confront(observed())
+    assert out.intent == Intent.RESUME and out.pushed is False
+    assert not [c for c in speaker.calls if c[2] == "flat"]
+    assert conv.state == State.WATCHING and conv.anchor.detour_until is None
+    assert speaker.calls[-1][0] == R.accept_line("en")
+    assert len(listener.calls) == 2
+
+
+def test_clear_replies_skip_the_model_round_trip(settings, store, clock):
+    llm = FakeLLM(replies=[ReplyIntent(Intent.EVASIVE)] * 5)
+    conv, speaker, _ = anchored(settings, store, clock, replies=["twenty minutes"], llm=llm)
+    conv.confront(observed())
+    assert not [c for c in llm.calls if c[0] == "classify_reply"]        # answered locally, instantly
+    conv.anchor.detour_until = None
+    conv.state = State.WATCHING
+    conv2, _, listener2 = make_conv(settings, store, clock, [], llm=llm)
+    conv2.start_session()
+    listener2.replies = ["the weather is nice", "ten minutes"]
+    conv2.confront(observed())
+    assert len([c for c in llm.calls if c[0] == "classify_reply"]) == 1   # only the ambiguous reply asked the model
+
+
+@pytest.mark.parametrize("reply", ["stop", "shut up", "leave me alone", "chup", "बस करो"])
+def test_stop_means_stop_no_pushback_and_cooler_register(settings, store, clock, reply):
+    conv, speaker, listener = anchored(settings, store, clock, replies=[reply])
+    out = conv.confront(observed())
+    assert out.intent == Intent.RESUME and out.pushed is False
+    assert not [c for c in speaker.calls if c[2] == "flat"]
+    assert conv.state == State.WATCHING and conv.current_register() == Register.DRY
+    assert speaker.calls[-1][0] == R.accept_line("en")                   # no farewell roast
+
+
+def test_jab_gets_one_comeback_then_the_question_stands(settings, store, clock):
+    conv, speaker, listener = anchored(settings, store, clock, replies=["you're just a bot", "twenty minutes"])
+    out = conv.confront(observed())
+    texts = [t for t, _, _ in speaker.calls]
+    comebacks = [t for t, _, tone in speaker.calls if tone == "deadpan" and "?" not in t]
+    assert len(comebacks) == 1 and len(comebacks[0].split()) <= 12
+    assert out.pushed is True and out.intent == Intent.DEFER and out.minutes == 20
+    # a second jab in the same session gets a different line, never the same one twice
+    conv.anchor.detour_until = None
+    conv.state = State.WATCHING
+    listener.replies = ["stupid bot", "ten minutes"]
+    conv.confront(observed())
+    comebacks2 = [t for t, _, tone in speaker.calls if tone == "deadpan" and "?" not in t]
+    assert len(comebacks2) == 2 and comebacks2[0] != comebacks2[1]
+
+
+def test_roast_is_spoken_with_its_delivery_tag(settings, store, clock):
+    from anchor.models import ComposeResult
+    llm = FakeLLM(compositions=[ComposeResult(
+        roast="Twelve minutes into researching whether crabs can swim on Google. Bold pivot.",
+        choice_line="Short break, or is this the new main thing?", delivery="disbelief", mechanism="status reversal")])
+    conv, speaker, _ = anchored(settings, store, clock, replies=["ten minutes"], llm=llm)
+    out = conv.confront(observed())
+    assert out.joke_used
+    roast_call = [c for c in speaker.calls if "crabs" in c[0]][0]
+    assert roast_call[2] == "disbelief"
+    events = [e for e in store.recent_events(20) if e["state"] == "ROAST"]
+    assert events and "delivery=disbelief" in events[0]["detail"]
+
+
+def test_llm_evasive_is_overridden_by_local_resume(settings, store, clock):
+    llm = FakeLLM(replies=[ReplyIntent(Intent.EVASIVE)])
+    conv, speaker, _ = anchored(settings, store, clock, replies=["I'll go back to it now"], llm=llm)
+    out = conv.confront(observed())
+    assert out.intent == Intent.RESUME and out.pushed is False
+
+
+def test_back_in_ten_minutes_is_a_break_not_a_resume(settings, store, clock):
+    conv, speaker, _ = anchored(settings, store, clock, replies=["I'll be back in ten minutes"])
+    out = conv.confront(observed())
+    assert out.intent == Intent.DEFER and out.minutes == 10
+
+
+def test_urdu_script_reply_is_treated_as_hindi_break(settings, store, clock):
+    conv, speaker, _ = anchored(settings, store, clock, replies=["ایک شارٹ بریک", "two minutes"])
+    out = conv.confront(observed())
+    assert out.intent == Intent.DEFER and out.minutes == 2
+
+
 def test_evasive_gets_exactly_one_flat_pushback_then_accepts(settings, store, clock):
     conv, speaker, listener = anchored(settings, store, clock, replies=["hmm whatever", "yeah still true, twenty minutes"])
     out = conv.confront(observed())

@@ -38,6 +38,7 @@ class Intent(str, Enum):
     DEFER = "DEFER"
     SWITCH = "SWITCH"
     DONE = "DONE"
+    RESUME = "RESUME"      # "I'm going back to it now" — no break, no switch, just watch again
     EVASIVE = "EVASIVE"
 
 
@@ -135,10 +136,24 @@ class Observed:
 
 
 @dataclass
+class ComposeResult:
+    """What the roast-writing model returns. ``roast_id`` is R01–R10 only when an approved line is used verbatim."""
+
+    roast: str
+    choice_line: str
+    delivery: str = "deadpan"            # deadpan | mock_respect | disbelief
+    mechanism: Optional[str] = None
+    roast_id: Optional[str] = None
+
+
+@dataclass
 class Composition:
     roast: str
     choice_line: str
     joke_used: bool
+    delivery: str = "deadpan"            # performance direction for the speech path; never spoken
+    roast_id: Optional[str] = None
+    mechanism: Optional[str] = None
 
 
 @dataclass

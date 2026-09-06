@@ -14,6 +14,9 @@ from dotenv import load_dotenv
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
+# Booty Globlin intensities ↔ the register ladder (dry | playful | spicy). Default "playful" == persona "pointed".
+INTENSITY_TO_REGISTER = {"playful": "dry", "pointed": "playful", "savage": "spicy"}
+
 
 def load_env() -> None:
     """Load .env from ANCHOR_ENV, the project root, or the current directory (first found)."""
@@ -57,6 +60,7 @@ class Settings:
 
     # Behaviour constants
     max_confrontations_per_hour: int = 4
+    roast_cooldown_s: int = 45           # minimum gap between two unsolicited roasts (persona pack default)
     cache_ttl_s: int = 1800
     hamming_threshold: int = 12          # dhash bits (of 64) that count as "pixels diverged"
     vision_cooldown_s: int = 60          # at most one forced "look" per context per minute (videos, animations)
@@ -78,6 +82,13 @@ class Settings:
         load_env()
         s = cls()
         s.demo = _truthy("ANCHOR_DEMO")
+        if s.demo:
+            s.max_confrontations_per_hour = 12   # a rehearsal repeats the whole script several times an hour
+            s.roast_cooldown_s = 0               # "still playing after the break" must be called within seconds
+        # Persona intensity (playful | pointed | savage) maps onto the register ladder; it is selected, never escalated.
+        intensity = os.environ.get("ANCHOR_INTENSITY", "").strip().lower()
+        if intensity in INTENSITY_TO_REGISTER:
+            s.default_register = INTENSITY_TO_REGISTER[intensity]
         s.silent = _truthy("ANCHOR_SILENT")
         s.exclude_titles = _truthy("EXCLUDE_TITLES")
         s.profanity_ok = _truthy("ANCHOR_PROFANITY")

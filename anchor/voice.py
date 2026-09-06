@@ -19,18 +19,45 @@ from typing import Optional
 from anchor.config import Settings, api_key_present
 from anchor.models import Listener, Speaker
 
-TONE_BRIEFS = {  # instructions for TTS by tone
-    "roast": "Light, dry, amused, never mocking. Conversational, brief.",
+ROAST_DELIVERY = (  # the persona pack's VOICE DELIVERY paragraph, verbatim; performance only, never joke content
+    "Speak in clear, natural English with a light Indian conversational cadence. Sound like a dry, "
+    "quick-witted teammate who has just noticed something embarrassing. Relaxed confidence, understated "
+    "amusement, crisp consonants. Keep it understandable on one hearing. A tiny pause before the final "
+    "reveal is enough; do not insert a pause into every clause. Land the punchline cleanly and stop. No "
+    "shouting, giggling, canned laughter, cartoon goblin growl, exaggerated accent, or motivational tone. "
+    "Don't sound wounded or angry. Read the supplied words exactly; never add a greeting, explanation, or "
+    "extra joke."
+)
+
+TONE_BRIEFS = {  # instructions for TTS by tone; the three delivery tags refine the roast base
+    "roast": ROAST_DELIVERY,
+    "deadpan": ROAST_DELIVERY + " Delivery: deadpan, almost matter-of-fact.",
+    "mock_respect": ROAST_DELIVERY + " Delivery: mock respect, briefly polite before the sting.",
+    "disbelief": ROAST_DELIVERY + " Delivery: disbelief, slight incredulity without raising volume.",
     "flat": "Flat, calm, matter-of-fact. No humour, no warmth, no edge.",
     "warm": "Warm, plain, friendly. Brief.",
     "neutral": "Clear, friendly and brief.",
 }
 HINDI_BRIEF = " Speak natural, everyday Hindi."
+_ROAST_TAGS = ("roast", "deadpan", "mock_respect", "disbelief")
+
+
+def tts_brief(tone: str, language: str) -> str:
+    """The performance instruction for one utterance. Hindi roasts keep the persona's manner, in Hindi."""
+    brief = TONE_BRIEFS.get(tone, TONE_BRIEFS["neutral"])
+    if language != "hi":
+        return brief
+    if tone in _ROAST_TAGS:
+        return brief.replace(
+            "Speak in clear, natural English with a light Indian conversational cadence.",
+            "Speak natural, everyday Hindi (Devanagari text), with a light conversational cadence.",
+        )
+    return brief + HINDI_BRIEF
 
 TTS_RATE = 24_000            # gpt-4o-mini-tts "pcm" output: 24 kHz mono int16
 STT_RATE = 16_000            # capture rate for webrtcvad and transcription
 FRAME_SAMPLES = 480          # 30 ms at 16 kHz, the largest frame webrtcvad accepts
-TRAIL_SILENCE_FRAMES = 30    # 0.9 s of silence ends an utterance
+TRAIL_SILENCE_FRAMES = 22    # 0.66 s of silence ends an utterance (the reply must feel immediate)
 PREROLL_FRAMES = 10          # 300 ms kept from just before speech onset
 
 
@@ -68,6 +95,45 @@ class OpenAISpeaker:
         self._client = client
         self.fallback: Speaker = fallback if fallback is not None else SayFallbackSpeaker()
         self._lock = threading.Lock()  # one utterance at a time, whichever thread asks
+        self._cache: dict[tuple[str, str, str], bytes] = {}   # pre-synthesized PCM for lines we know are coming
+        self._cache_lock = threading.Lock()
+
+    def prefetch(self, text: str, *, language: str = "en", tone: str = "neutral") -> bool:
+        """Synthesize ``text`` into memory ahead of time so a later ``speak`` starts instantly. Never raises."""
+        key = (text.strip(), language, tone)
+        if not key[0]:
+            return False
+        with self._cache_lock:
+            if key in self._cache:
+                return True
+        try:
+            pcm = self._synthesize(text, language, tone)
+        except Exception:
+            return False
+        with self._cache_lock:
+            if len(self._cache) >= 32:
+                self._cache.pop(next(iter(self._cache)))
+            self._cache[key] = pcm
+        return True
+
+    def _synthesize(self, text: str, language: str, tone: str) -> bytes:
+        brief = tts_brief(tone, language)
+        with self.client.audio.speech.with_streaming_response.create(
+            model=self.settings.tts_model,
+            voice=self.settings.voice,
+            input=text,
+            instructions=brief,
+            response_format="pcm",
+        ) as resp:
+            return b"".join(resp.iter_bytes(4096))
+
+    def _play(self, pcm: bytes) -> None:
+        import sounddevice as sd
+
+        usable = len(pcm) - len(pcm) % 2
+        with sd.RawOutputStream(samplerate=TTS_RATE, channels=1, dtype="int16") as out:
+            for i in range(0, usable, 4096):
+                out.write(pcm[i:i + 4096])
 
     @property
     def client(self):
@@ -83,7 +149,12 @@ class OpenAISpeaker:
             return
         with self._lock:
             try:
-                self._stream(text, language, tone)
+                with self._cache_lock:
+                    cached = self._cache.pop((text.strip(), language, tone), None)
+                if cached:
+                    self._play(cached)
+                else:
+                    self._stream(text, language, tone)
             except Exception:
                 try:
                     self.fallback.speak(text, language=language, tone=tone)
@@ -93,7 +164,7 @@ class OpenAISpeaker:
     def _stream(self, text: str, language: str, tone: str) -> None:
         import sounddevice as sd
 
-        brief = TONE_BRIEFS.get(tone, TONE_BRIEFS["neutral"]) + (HINDI_BRIEF if language == "hi" else "")
+        brief = tts_brief(tone, language)
         with self.client.audio.speech.with_streaming_response.create(
             model=self.settings.tts_model,
             voice=self.settings.voice,
@@ -201,8 +272,50 @@ class FakeListener:
         return self.replies.pop(0) if self.replies else ""
 
 
+class FileListener:
+    """Text stand-in for the microphone: replies are lines appended to a file (``ANCHOR_REPLY_FILE``).
+
+    Used for scripted end-to-end runs on a real desktop where nobody is speaking. ``listen`` waits up to
+    ``window_s`` for a non-empty line, consumes it, and returns it; silence returns "" like the real one.
+    """
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self.calls: list[tuple[float, str]] = []
+
+    def listen(self, *, window_s: float = 8.0, language: str = "en") -> str:
+        import os
+        import time
+
+        self.calls.append((window_s, language))
+        deadline = time.monotonic() + max(0.5, window_s)
+        while time.monotonic() < deadline:
+            try:
+                if os.path.exists(self.path):
+                    with open(self.path, "r", encoding="utf-8") as fh:
+                        lines = fh.read().splitlines()
+                    if lines:
+                        first, rest = lines[0], lines[1:]
+                        with open(self.path, "w", encoding="utf-8") as fh:
+                            fh.write("\n".join(rest) + ("\n" if rest else ""))
+                        if first.strip():
+                            return first.strip()
+            except Exception:
+                pass
+            time.sleep(0.25)
+        return ""
+
+
 def make_voice(settings: Settings) -> tuple[Speaker, Listener]:
-    """The OpenAI pair when a key is configured; otherwise ``say`` plus a listener that hears nothing."""
+    """The OpenAI pair when a key is configured; otherwise ``say`` plus a listener that hears nothing.
+
+    ``ANCHOR_REPLY_FILE=path`` swaps the microphone for a text file (scripted desktop runs)."""
+    import os
+
+    reply_file = os.environ.get("ANCHOR_REPLY_FILE", "").strip()
+    speaker: Speaker = OpenAISpeaker(settings) if api_key_present() else SayFallbackSpeaker()
+    if reply_file:
+        return speaker, FileListener(reply_file)
     if api_key_present():
-        return OpenAISpeaker(settings), OpenAIListener(settings)
-    return SayFallbackSpeaker(), FakeListener()
+        return speaker, OpenAIListener(settings)
+    return speaker, FakeListener()

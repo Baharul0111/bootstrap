@@ -13,6 +13,7 @@ Guarantees that live here as code, not as prompt wording:
 from __future__ import annotations
 
 import datetime as dt
+import threading
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Callable, Optional
@@ -39,6 +40,46 @@ ACK_LINE = {
     "en": "Got it. I'll stay out of your way.",
     "hi": "ठीक है। मैं चुप रहूँगा।",
 }
+HOW_LONG_LINE = {
+    "en": "How long do you need?",
+    "hi": "कितना समय चाहिए?",
+}
+_STOP_WORDS = ["stop", "shut up", "leave me alone", "go away", "enough", "chup", "band karo", "bas karo",
+               "चुप", "बंद करो", "बस करो"]
+_JAB_WORDS = ["just a bot", "you're a bot", "youre a bot", "stupid bot", "dumb bot", "useless bot", "shut up bot",
+              "you're just an app", "who asked you"]
+_COMEBACKS = ["A bot that noticed. That's one of us.", "Bot, yes. Distracted, no.",
+              "Small program. Still ahead on points."]
+
+
+def _persona():
+    try:
+        from . import personality as P
+        return P
+    except Exception:
+        return None
+
+
+def is_stop(text: str) -> bool:
+    P = _persona()
+    if P is not None and hasattr(P, "is_stop"):
+        try:
+            return bool(P.is_stop(text))
+        except Exception:
+            pass
+    low = (text or "").lower()
+    return any(w in low for w in _STOP_WORDS)
+
+
+def is_jab(text: str) -> bool:
+    P = _persona()
+    if P is not None and hasattr(P, "is_jab"):
+        try:
+            return bool(P.is_jab(text))
+        except Exception:
+            pass
+    low = (text or "").lower()
+    return any(w in low for w in _JAB_WORDS)
 
 
 def apply_tempo(policy: Policy, settings: Settings) -> Policy:
@@ -51,7 +92,7 @@ def apply_tempo(policy: Policy, settings: Settings) -> Policy:
     policy.patience_seconds = DEMO_PATIENCE_S
     policy.pause_idle_s = None if policy.pause_idle_s is None else 2
     policy.pause_stable_s = 3
-    policy.tolerance_seconds = 30
+    policy.tolerance_seconds = 120     # a helper surface (search, AI chat, docs) still counts as the task for 2 min
     return policy
 
 
@@ -98,6 +139,7 @@ class Conversation:
         self.transcript: deque[str] = deque(maxlen=30)
         self.last_line = ""
         self.last_confrontation_ts: Optional[float] = None
+        self.comebacks_used: set[str] = set()
 
     # ------------------------------------------------------------------ helpers
     @property
@@ -245,7 +287,33 @@ class Conversation:
         self.confrontations_this_anchor = 0
         self.say(ACK_LINE.get(draft.language, ACK_LINE["en"]), tone="warm", language=draft.language)
         self._set_state(State.WATCHING, f"anchored: {sentence}")
+        self.prefetch_lines()
         return anchor
+
+    def prefetch_lines(self) -> None:
+        """Pre-synthesize the fixed lines this anchor can need, in the background, so replies feel instant."""
+        speaker = self.speaker
+        if self.anchor is None or self.muted or not hasattr(speaker, "prefetch"):
+            return
+        lang = self.language()
+        verbatim = self.anchor.verbatim
+        lines = [
+            (R.pushback_line(verbatim, lang), "flat"),
+            (HOW_LONG_LINE.get(lang, HOW_LONG_LINE["en"]), "warm"),
+            (R.accept_line(lang), "warm"),
+            (R.detour_reminder(verbatim, None, lang), "warm"),
+            (R.congrats(lang), "warm"),
+            (R.whats_next(lang), "warm"),
+        ]
+
+        def work() -> None:
+            for text, tone in lines:
+                try:
+                    speaker.prefetch(text, language=lang, tone=tone)
+                except Exception:
+                    return
+
+        threading.Thread(target=work, name="anchor-prefetch", daemon=True).start()
 
     # ------------------------------------------------------------------ confrontation
     def may_confront(self, now: Optional[float] = None) -> bool:
@@ -259,28 +327,72 @@ class Conversation:
         recent = self.store.count_events("CONFRONTING", now - 3600)
         return recent < self.settings.max_confrontations_per_hour
 
+    def comeback(self) -> str:
+        """One short comeback when the user jabs at the companion; each line at most once per session."""
+        lines: list[str] = []
+        P = _persona()
+        if P is not None:
+            try:
+                lines = list(P.load_personality().comebacks)
+            except Exception:
+                lines = []
+        lines = lines or list(_COMEBACKS)
+        for line in lines:
+            if line not in self.comebacks_used:
+                self.comebacks_used.add(line)
+                return line
+        return ""
+
     def classify(self, reply: str) -> ReplyIntent:
         if not reply or not reply.strip():
             return ReplyIntent(Intent.EVASIVE, language=self.language())
+        if is_stop(reply):
+            # "Stop" means stop: no push-back, no farewell joke, gentler for the rest of the day.
+            return ReplyIntent(Intent.RESUME, sentiment=Sentiment.IRRITATED, language=H.detect_language(reply))
         default_minutes = self.policy.default_detour_minutes if self.policy else self.settings.default_detour_minutes
         now_local = dt.datetime.fromtimestamp(self.now()).strftime("%H:%M")
-        intent = None
-        try:
-            intent = self.llm.classify_reply(reply, self.anchor, self.language(), default_minutes, now_local) if self.llm else None
-        except Exception:
-            intent = None
         local = H.classify_reply_keywords(reply, default_minutes, self.now())
+        intent = None
+        if local.intent != Intent.EVASIVE:
+            intent = local                       # unambiguous locally: answer within a breath, no model round-trip
+        else:
+            try:
+                intent = self.llm.classify_reply(reply, self.anchor, self.language(), default_minutes, now_local) if self.llm else None
+            except Exception:
+                intent = None
         if intent is None:
             intent = local
-        if intent.intent == Intent.DEFER and not intent.minutes:
-            intent.minutes = H.parse_duration_minutes(reply, default_minutes, self.now()) or default_minutes
+        if intent.intent == Intent.DEFER:
+            # minutes stays None ONLY when the reply carries no amount at all ("I just need a short break"):
+            # the branch then asks "How long?" once. Vague amounts ("a bit") take the default.
+            local_minutes = H.parse_duration_minutes(reply, -1, self.now())
+            if local_minutes is None:
+                intent.minutes = None
+            elif local_minutes == -1:
+                intent.minutes = intent.minutes or default_minutes
+            else:
+                intent.minutes = intent.minutes or local_minutes
         if intent.intent == Intent.SWITCH and not (intent.new_anchor or "").strip():
             intent.new_anchor = (local.new_anchor or reply).strip()
         if local.sentiment == Sentiment.IRRITATED:
             intent.sentiment = Sentiment.IRRITATED
+        if intent.intent == Intent.EVASIVE and local.intent == Intent.RESUME:
+            intent.intent = Intent.RESUME          # "I'll go back to it" is an answer, not a dodge
         return intent
 
-    def confront(self, observed: Observed) -> ConfrontOutcome:
+    def compose_for(self, observed: Observed) -> Composition:
+        """The roast + choice line for the NEXT confrontation. Safe to call ahead of time from a worker thread."""
+        assert self.anchor is not None and self.policy is not None
+        lang = self.language()
+        try:
+            return self.composer.compose(
+                self.anchor, observed, self.policy, self.current_register(), self.confrontations_this_anchor,
+                lang, muted=self.muted,
+            )
+        except Exception:
+            return Composition(R.plain_statement(self.anchor, observed, lang), R.choice_line(lang), False)
+
+    def confront(self, observed: Observed, precomposed: Optional[Composition] = None) -> ConfrontOutcome:
         """Roast + forced choice, ONE optional flat push-back, then accept whatever comes."""
         assert self.anchor is not None and self.policy is not None
         push_used = False                                  # owned by this function, never by the model
@@ -288,20 +400,24 @@ class Conversation:
         self.last_confrontation_ts = self.now()
         self._set_state(State.CONFRONTING, observed.activity)
         lang = self.language()
-        register = self.current_register()
-        repeat_index = self.confrontations_this_anchor
-        try:
-            comp = self.composer.compose(
-                self.anchor, observed, self.policy, register, repeat_index, lang, muted=self.muted
-            )
-        except Exception:
-            comp = Composition(R.plain_statement(self.anchor, observed, lang), R.choice_line(lang), False)
+        comp = precomposed or self.compose_for(observed)
         self.confrontations_this_anchor += 1
         line = f"{comp.roast} {comp.choice_line}".strip()
-        self.say(line, tone="roast" if comp.joke_used else "warm", language=lang)
+        tone = (comp.delivery or "roast") if comp.joke_used else "warm"
+        self.store.log_event(
+            self.anchor.id, "ROAST",
+            f"joke={comp.joke_used} id={comp.roast_id} mechanism={comp.mechanism} delivery={comp.delivery} text={comp.roast}",
+            self.now(),
+        )
+        self.say(line, tone=tone, language=lang)
         spoken.append(line)
 
         reply = self.hear(language=lang)
+        if reply and is_jab(reply) and not is_stop(reply):
+            back = self.comeback()                       # at most one, then the question stands
+            if back:
+                self.say(back, tone="deadpan", language=lang)
+                spoken.append(back)
         intent = self.classify(reply)
         self._cool_if_irritated(intent)
 
@@ -328,6 +444,26 @@ class Conversation:
         assert self.anchor is not None and self.policy is not None
         lang = self.language()
         if intent.intent == Intent.DEFER:
+            spoken: list[str] = []
+            if intent.minutes is None:
+                # No amount was given: ask once, then take whatever comes (silence → the default).
+                ask = HOW_LONG_LINE.get(lang, HOW_LONG_LINE["en"])
+                self.say(ask, tone="warm", language=lang)
+                spoken.append(ask)
+                answer = self.hear(language=lang)
+                parsed = H.parse_duration_minutes(answer, self.policy.default_detour_minutes, self.now()) if answer else None
+                if parsed is None and answer:
+                    llm_intent = None
+                    try:
+                        now_local = dt.datetime.fromtimestamp(self.now()).strftime("%H:%M")
+                        llm_intent = self.llm.classify_reply(
+                            answer, self.anchor, lang, self.policy.default_detour_minutes, now_local
+                        ) if self.llm else None
+                    except Exception:
+                        llm_intent = None
+                    if llm_intent is not None and llm_intent.intent == Intent.DEFER and llm_intent.minutes:
+                        parsed = llm_intent.minutes
+                intent.minutes = parsed or self.policy.default_detour_minutes
             minutes = int(intent.minutes or self.policy.default_detour_minutes)
             minutes = max(1, minutes)
             until = self.now() + minutes * 60
@@ -338,7 +474,7 @@ class Conversation:
             line = R.detour_confirm(minutes, back_at, lang)
             self.say(line, tone="warm", language=lang)
             self._set_state(State.DETOUR, f"{minutes} min until {back_at}")
-            return ConfrontOutcome(Intent.DEFER, minutes=minutes, spoken=[line])
+            return ConfrontOutcome(Intent.DEFER, minutes=minutes, spoken=spoken + [line])
 
         if intent.intent == Intent.SWITCH:
             new_sentence = (intent.new_anchor or "").strip()
@@ -347,6 +483,12 @@ class Conversation:
             self._set_state(State.SWITCH, new_sentence)
             self.adopt(new_sentence, allow_clarify=False)             # no follow-up question mid-flow
             return ConfrontOutcome(Intent.SWITCH, new_anchor=new_sentence)
+
+        if intent.intent == Intent.RESUME:
+            line = R.accept_line(lang)
+            self.say(line, tone="warm", language=lang)
+            self._set_state(State.WATCHING, "resumed the anchor")
+            return ConfrontOutcome(Intent.RESUME, spoken=[line])
 
         if intent.intent == Intent.DONE:
             old = self.anchor
@@ -387,4 +529,6 @@ class Conversation:
                 or H.classify_reply_keywords(reply, 0, now).intent == Intent.DEFER
             ):
                 self.apply(intent)
+            elif intent.intent == Intent.RESUME:
+                self.say(R.accept_line(lang), tone="warm", language=lang)
         return True

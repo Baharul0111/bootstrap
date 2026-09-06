@@ -60,10 +60,11 @@ def test_reminder_fires_on_time_and_is_plain(settings, store, clock):
     clock.advance(2)
     eng.tick()
     assert conv.state == State.WATCHING
-    text, lang, tone = speaker.calls[-1]
+    text, lang, tone = [c for c in speaker.calls if "You said" in c[0]][-1]
     assert text == R.detour_reminder(conv.anchor.verbatim, None, "en")
     assert conv.anchor.verbatim in text
     assert tone == "warm" and "Bold pivot" not in text
+    assert speaker.calls[-1][0] == R.accept_line("en")          # "yes" → a plain acknowledgement, then watching
     assert store.active_anchor().detour_until is None
     # fires once only
     n = len(speaker.calls)

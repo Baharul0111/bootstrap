@@ -16,6 +16,7 @@ import pytest
 from anchor.config import Settings
 from anchor.voice import (
     HINDI_BRIEF,
+    ROAST_DELIVERY,
     TONE_BRIEFS,
     FakeListener,
     FakeSpeaker,
@@ -117,9 +118,40 @@ def test_fake_listener_pops_replies_then_returns_empty():
 # --- speaker ---------------------------------------------------------------
 
 
-def test_tone_briefs_has_the_four_tones():
-    assert set(TONE_BRIEFS) == {"roast", "flat", "warm", "neutral"}
+def test_tone_briefs_has_the_seven_tones():
+    assert set(TONE_BRIEFS) == {"roast", "deadpan", "mock_respect", "disbelief", "flat", "warm", "neutral"}
     assert all(isinstance(v, str) and v.strip() for v in TONE_BRIEFS.values())
+
+
+def test_roast_brief_is_the_persona_delivery_paragraph():
+    assert TONE_BRIEFS["roast"] == ROAST_DELIVERY
+    assert ROAST_DELIVERY.startswith("Speak in clear, natural English with a light Indian conversational cadence.")
+    assert ROAST_DELIVERY.endswith("never add a greeting, explanation, or extra joke.")
+    assert "Land the punchline cleanly and stop." in ROAST_DELIVERY
+
+
+@pytest.mark.parametrize(
+    "tag, refinement",
+    [
+        ("deadpan", "almost matter-of-fact"),
+        ("mock_respect", "briefly polite before the sting"),
+        ("disbelief", "slight incredulity without raising volume"),
+    ],
+)
+def test_delivery_tags_extend_the_persona_paragraph_with_their_own_refinement(tag, refinement):
+    brief = TONE_BRIEFS[tag]
+    assert brief.startswith(ROAST_DELIVERY)
+    assert refinement in brief[len(ROAST_DELIVERY):]
+    others = {"almost matter-of-fact", "briefly polite before the sting", "slight incredulity without raising volume"}
+    assert all(other not in brief for other in others - {refinement})
+
+
+def test_flat_brief_is_unchanged_and_joke_free():
+    assert TONE_BRIEFS["flat"] == "Flat, calm, matter-of-fact. No humour, no warmth, no edge."
+    assert "No humour" in TONE_BRIEFS["flat"]
+    assert ROAST_DELIVERY not in TONE_BRIEFS["flat"]
+    assert TONE_BRIEFS["warm"] == "Warm, plain, friendly. Brief."
+    assert TONE_BRIEFS["neutral"] == "Clear, friendly and brief."
 
 
 def test_openai_speaker_falls_back_when_tts_raises(fake_audio):
@@ -143,7 +175,15 @@ def test_openai_speaker_falls_back_when_audio_device_fails(fake_audio):
 
 @pytest.mark.parametrize(
     "tone, language, expected_brief",
-    [("roast", "hi", TONE_BRIEFS["roast"] + HINDI_BRIEF), ("flat", "en", TONE_BRIEFS["flat"])],
+    [
+        ("roast", "hi", TONE_BRIEFS["roast"].replace(
+            "Speak in clear, natural English with a light Indian conversational cadence.",
+            "Speak natural, everyday Hindi (Devanagari text), with a light conversational cadence.")),
+        ("warm", "hi", TONE_BRIEFS["warm"] + HINDI_BRIEF),
+        ("flat", "en", TONE_BRIEFS["flat"]),
+        ("mock_respect", "en", TONE_BRIEFS["mock_respect"]),
+        ("disbelief", "en", TONE_BRIEFS["disbelief"]),
+    ],
 )
 def test_openai_speaker_streams_pcm_with_tone_and_language_brief(fake_audio, tone, language, expected_brief):
     chunks = [b"\x01\x00" * 100, b"\x00" * 5, b"\x00" * 3]  # includes an odd-length chunk
