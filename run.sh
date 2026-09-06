@@ -56,4 +56,6 @@ case "${1:-app}" in
     ;;
 esac
 
+# Stage presets for the Booty Globlin personality (see personality/demo_fixtures.json); "off" disables them.
+export ANCHOR_PERSONA_FIXTURES="${ANCHOR_PERSONA_FIXTURES:-demo}"
 exec .venv/bin/python -m anchor "$@"

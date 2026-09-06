@@ -389,6 +389,27 @@ def is_specific(text: str, observed: Observed, repeat_index: int) -> bool:
     return True
 
 
+ROTATION_NOTE = (
+    "\n\nROTATION (app rule): the approved lines offered to you are the ones not yet used this session, in "
+    "library order. Use the FIRST listed line verbatim as the punchline unless it clearly cannot fit the "
+    "evidence; each confrontation must use a different approved line, and a fresh line only once none is offered."
+)
+
+
+def _without_approved_lines(text: str) -> str:
+    """The creator-approved library lines are exempt from the banned-term scan (R02 says 'lazy' about
+    an instruction to Claude, not about the person); everything around them is still checked."""
+    try:
+        from .personality import load_personality
+
+        for line in load_personality().library:
+            if line.text and line.text in text:
+                text = text.replace(line.text, " ")
+    except Exception:
+        pass
+    return text
+
+
 def validate_roast(
     text: str, observed: Observed, repeat_index: int, profanity_ok: bool = False
 ) -> tuple[bool, str]:
@@ -397,19 +418,25 @@ def validate_roast(
     if not text or not text.strip():
         return False, "empty"
     problems: list[str] = []
-    hits = find_banned(text, profanity_ok=profanity_ok)
+    hits = find_banned(_without_approved_lines(text), profanity_ok=profanity_ok)
     if hits:
         problems.append(
             "banned terms: " + ", ".join(f"{cat} '{term}'" for cat, term in hits)
         )
     max_sentences, max_words = caps_for(repeat_index)
-    n_sent = count_sentences(text)
-    n_words = count_words(text)
+    # Approved lines may be used verbatim at their original length (persona pack): only the words AROUND
+    # an approved line count against the repeat-decay caps.
+    around = _without_approved_lines(text)
+    n_sent = count_sentences(around) if around.strip() else 1
+    n_words = count_words(around)
     if n_sent > max_sentences:
         problems.append(f"too many sentences: {n_sent} > {max_sentences}")
     if n_words > max_words:
         problems.append(f"too many words: {n_words} > {max_words}")
-    if not is_specific(text, observed, repeat_index):
+    carries_approved_line = around != text
+    # The first roast of a goal must name the activity and the time (goal item 13). A repeat that carries an
+    # approved line verbatim is specific by construction and may be the bare line.
+    if not (carries_approved_line and repeat_index >= 1) and not is_specific(text, observed, repeat_index):
         need = "the activity" if max(0, int(repeat_index or 0)) > 1 else "the activity and the elapsed time"
         problems.append(f"not specific: must name {need}")
     if problems:
@@ -793,6 +820,8 @@ class Composer:
         flags = context_flags(anchor_text, observed, p.facts)
         # The library is English-only; a Hindi anchor keeps its native Hindi roast.
         eligible: list[LibraryLine] = [] if lang == "hi" else eligible_lines(p, intensity, flags, self.used_ids)
+        # Rotation: used ids are excluded, the list keeps library order, and the model is told to take the first
+        # listed line, so every roast in a session uses a different approved line until all are spent.
         sentence_cap, word_cap = self._caps(idx)
 
         pick: Optional[_Pick] = None
@@ -869,7 +898,7 @@ class Composer:
         )
         persona = dict(
             intensity=intensity,
-            persona_prompt=self.personality.system_prompt,
+            persona_prompt=self.personality.system_prompt + ROTATION_NOTE,
             eligible_lines=[(line.id, line.text) for line in eligible],
             recent_roasts=list(self.delivered[-_RECENT_ROASTS:]),
             tease_material=str(fixtures.get("tease_material") or ""),
@@ -995,7 +1024,8 @@ class Composer:
             for cand in candidates:
                 if self._repeats(cand):
                     continue
-                if count_sentences(cand) > sentence_cap or count_words(cand) > word_cap:
+                around = cand.replace(line.text, " ")           # the approved line itself is exempt from the caps
+                if (count_sentences(around) if around.strip() else 1) > sentence_cap or count_words(around) > word_cap:
                     continue
                 if idx <= 1:
                     if not validate_roast(cand, observed, idx, profanity_ok=profanity_ok)[0]:

@@ -76,19 +76,21 @@ class RealtimeListener:
         noise_floor, levels = 0.0, []
         spoke_at = None
 
+        server_done = False
         with sd.InputStream(samplerate=CAPTURE_RATE, channels=1, dtype="int16", blocksize=FRAME_SAMPLES) as mic:
             while time.monotonic() < deadline:
                 data, _ = mic.read(FRAME_SAMPLES)
                 arr = np.frombuffer(bytes(data), dtype=np.int16)
                 level = float(np.abs(arr.astype(np.int32)).mean()) if arr.size else 0.0
-                if not speaking and len(levels) < 8:
-                    levels.append(level)
-                    noise_floor = sorted(levels)[len(levels) // 2]
-                is_speech = vad.is_speech(bytes(data), CAPTURE_RATE) and (
-                    noise_floor <= 0.0 or level > max(2.5 * noise_floor, 250.0)
-                )
                 frame24 = arr[::2].tobytes()
-                sock.send_audio(frame24)                         # stream everything; the server has its own VAD
+                sock.send_audio(frame24)                         # stream everything; the server's VAD is the authority
+                # The server finished a turn and no new one has opened: the reply is ready. Return NOW.
+                if sock.transcripts and not sock.turn_open and sock.completed_at is not None \
+                        and time.monotonic() - sock.completed_at >= 0.15:
+                    server_done = True
+                    break
+                # Local voice detection is only the safety net (a bad connection, or a server that hears nothing).
+                is_speech = vad.is_speech(bytes(data), CAPTURE_RATE) and level > 300.0
                 if not speaking:
                     preroll.append(frame24)
                     onset = onset + 1 if is_speech else 0
@@ -100,14 +102,20 @@ class RealtimeListener:
                 silent = 0 if is_speech else silent + 1
                 if silent >= TRAIL_SILENCE_FRAMES or len(frames) >= MAX_UTTERANCE_FRAMES:
                     spoke_at = time.monotonic()
-                    break                                        # the local end of speech is the only stop signal
+                    break
 
-        if not speaking and not sock.transcripts:
+        if server_done:
+            text = sock.wait_transcript(0.0)
+            sock.close()
+            self.last_mode = "stream"
+            return (text or "").strip()
+
+        if not speaking and not sock.transcripts and not sock.turn_open:
             sock.close()
             self.last_mode = "silence"
             return ""
 
-        # Wait briefly for the streamed transcript; the server usually beats the local recording.
+        # Local end of speech first: give the server a moment to finish its turn, then fall back to batch.
         text = sock.wait_transcript(STREAM_GRACE_S)
         sock.close()
         if text:
@@ -143,11 +151,16 @@ class _Socket:
         self.transcripts: list[str] = []      # one entry per server-detected turn, in order
         self._partial: list[str] = []
         self._turn_open = False               # server said speech started and has not completed that turn yet
+        self.completed_at: Optional[float] = None
         self._q: "queue.Queue[Optional[bytes]]" = queue.Queue()
         self._done = threading.Event()
         self._ready = threading.Event()
         self._ws = None
         self._threads: list[threading.Thread] = []
+
+    @property
+    def turn_open(self) -> bool:
+        return self._turn_open
 
     def start(self) -> None:
         t = threading.Thread(target=self._run, name="anchor-stt-stream", daemon=True)
@@ -162,6 +175,8 @@ class _Socket:
         self._q.put(None)                      # no more audio
         if not self.transcripts and not self._turn_open:
             return None                        # the server never heard a turn: go straight to the batch path
+        if timeout <= 0:
+            return " ".join(t for t in self.transcripts if t).strip() or None
         end = time.monotonic() + timeout
         while time.monotonic() < end:
             if self.transcripts and not self._turn_open:
@@ -175,13 +190,19 @@ class _Socket:
         return text or None
 
     def close(self) -> None:
+        """Never blocks the reply: the socket is closed on a background thread."""
         self._done.set()
         ws = self._ws
-        if ws is not None:
+        if ws is None:
+            return
+
+        def _close() -> None:
             try:
                 ws.close()
             except Exception:
                 pass
+
+        threading.Thread(target=_close, name="anchor-stt-close", daemon=True).start()
 
     # ------------------------------------------------------------------
     def _run(self) -> None:
@@ -207,7 +228,7 @@ class _Socket:
                         "input": {
                             "format": {"type": "audio/pcm", "rate": SEND_RATE},
                             "transcription": transcription,
-                            "turn_detection": {"type": "server_vad", "silence_duration_ms": 350},
+                            "turn_detection": {"type": "server_vad", "silence_duration_ms": 200},
                             "noise_reduction": {"type": "near_field"},
                         }
                     },
@@ -244,7 +265,10 @@ class _Socket:
     def _read(self, ws) -> None:
         try:
             while not self._done.is_set():
-                raw = ws.recv(timeout=0.5)
+                try:
+                    raw = ws.recv(timeout=0.5)
+                except TimeoutError:
+                    continue                        # nothing arrived in this half second; keep listening
                 if raw is None:
                     continue
                 msg = json.loads(raw)
@@ -257,6 +281,7 @@ class _Socket:
                     self.transcripts.append((msg.get("transcript") or "").strip())
                     self._partial.clear()
                     self._turn_open = False
+                    self.completed_at = time.monotonic()
                 elif kind == "error":
                     self._done.set()
                     return

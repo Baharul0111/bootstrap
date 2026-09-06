@@ -407,8 +407,9 @@ def test_same_library_id_is_never_delivered_twice(demo_anchor, poki, policy, set
     assert out1.roast_id == "R06"
     assert len(llm.calls) == 3                                            # rejected, regenerated, rejected
     assert PACK_LINES["R06"] not in out2.roast
-    assert out2.roast_id == "R09" and out2.roast.endswith(PACK_LINES["R09"])
-    assert composer.used_ids == {"R06", "R09"}
+    # the deterministic fallback takes the next unused line in library order (approved lines are exempt from caps)
+    assert out2.roast_id == "R04" and out2.roast.endswith(PACK_LINES["R04"])
+    assert composer.used_ids == {"R06", "R04"}
     assert llm.calls[1]["eligible_lines"] == [(i, PACK_LINES[i]) for i in ("R04", "R05", "R09")]
 
 
@@ -461,7 +462,7 @@ def test_fallback_picks_the_strongest_fitting_line_for_the_context(demo_anchor, 
 def test_fallback_decays_and_never_escalates(anchor, observed, policy, settings):
     outs = [Composer(ResultLLM(), settings).compose(anchor, observed, policy, Register.PLAYFUL, i, "en")
             for i in range(4)]
-    assert outs[1].roast == "Google, 12 minutes in — " + PACK_LINES["R09"]
+    assert outs[1].roast.startswith("Google, 12 minutes in") and outs[1].roast.endswith(PACK_LINES["R09"])
     assert outs[2].roast == PACK_LINES["R09"] and outs[3].roast == PACK_LINES["R09"]
     assert all(o.roast_id == "R09" and o.joke_used for o in outs)
     assert validate_roast(outs[1].roast, observed, 1)[0]
@@ -469,7 +470,9 @@ def test_fallback_decays_and_never_escalates(anchor, observed, policy, settings)
     assert counts == sorted(counts, reverse=True)
     for i, o in enumerate(outs):
         sents, words = caps_for(i)
-        assert count_sentences(o.roast) <= sents and count_words(o.roast) <= words
+        from anchor.roast import _without_approved_lines
+        around = _without_approved_lines(o.roast)              # the approved line itself is exempt from the caps
+        assert (count_sentences(around) if around.strip() else 1) <= sents and count_words(around) <= words
         assert find_banned(o.roast) == []
 
 
@@ -478,9 +481,11 @@ def test_fallback_skips_used_lines_then_uses_the_template(anchor, observed, poli
     first = composer.compose(anchor, observed, policy, Register.PLAYFUL, 0, "en")
     second = composer.compose(anchor, observed, policy, Register.PLAYFUL, 1, "en")
     assert first.roast_id == "R09"
-    # R10 is the only other eligible line and cannot fit one sentence with a premise.
-    assert second.roast == fallback_roast(anchor, observed, 1, "en") and second.roast_id is None
+    # R10 is the only other eligible line; approved lines keep their own length, so it is used next.
+    assert second.roast_id == "R10" and second.roast.endswith(PACK_LINES["R10"])
     assert validate_roast(second.roast, observed, 1)[0] and second.joke_used
+    third = composer.compose(anchor, observed, policy, Register.PLAYFUL, 2, "en")
+    assert third.roast == fallback_roast(anchor, observed, 2, "en") and third.roast_id is None   # all lines spent
 
 
 def test_fallback_never_repeats_itself(anchor, observed, policy, settings):
@@ -537,7 +542,7 @@ def test_composer_passes_exactly_the_persona_contract(p, demo_anchor, poki, poli
     composer.compose(demo_anchor, poki, policy, Register.SPICY, 0, "en")
     call = llm.calls[0]
     assert set(call) == CONTRACT_KEYS
-    assert call["intensity"] == "savage" and call["persona_prompt"] == p.system_prompt
+    assert call["intensity"] == "savage" and call["persona_prompt"].startswith(p.system_prompt)
     assert call["eligible_lines"] == [(i, PACK_LINES[i]) for i in ("R04", "R05", "R06", "R09")]
     assert call["recent_roasts"] == [] and call["tease_material"] == "" and call["exclusions"] == ""
     assert (call["sentence_cap"], call["word_cap"], call["repeat_index"], call["language"]) == (2, 20, 0, "en")

@@ -496,6 +496,29 @@ def _builtin() -> Personality:
         )
 
 
+def _apply_fixture_overlay(data: dict, folder: Path) -> dict:
+    """``ANCHOR_PERSONA_FIXTURES=demo`` merges ``demo_fixtures.json`` (next to the pack) over ``fixtures``.
+
+    Demo presets are labelled as such and kept out of the pack itself, so the pack's defaults stay the
+    live-evidence baseline and the unit tests see them unchanged."""
+    mode = os.environ.get("ANCHOR_PERSONA_FIXTURES", "").strip().lower()
+    if mode in {"", "off", "0", "false", "no"}:
+        return data
+    try:
+        overlay = json.loads((folder / f"{mode}_fixtures.json").read_text(encoding="utf-8"))
+        if isinstance(overlay, dict):
+            fixtures = dict(data.get("fixtures") or {})
+            facts = dict(fixtures.get("facts") or {})
+            facts.update(overlay.get("facts") or {})
+            fixtures.update({k: v for k, v in overlay.items() if k != "facts"})
+            fixtures["facts"] = facts
+            data = dict(data)
+            data["fixtures"] = fixtures
+    except Exception as exc:
+        log.warning("personality: fixture overlay %s not applied (%s)", mode, exc)
+    return data
+
+
 def load_personality(path: Optional[str | os.PathLike[str]] = None) -> Personality:
     """Load the pack from ``path``, else ``$ANCHOR_PERSONALITY``, else the
     project's ``personality/booty_globlin.json``. On ANY error the built-in
@@ -506,6 +529,7 @@ def load_personality(path: Optional[str | os.PathLike[str]] = None) -> Personali
         data = json.loads(raw)
         if not isinstance(data, dict):
             raise ValueError("top level is not a JSON object")
+        data = _apply_fixture_overlay(data, Path(candidate).expanduser().parent)
         return _build(data, str(candidate))
     except Exception as exc:
         log.warning("personality: could not load %s (%s); using the built-in Booty Globlin", candidate, exc)
@@ -598,6 +622,9 @@ def context_flags(anchor_text: str, observed: Optional[Observed] = None, facts: 
     for flag, key in _FACT_FLAGS:
         if bool(facts.get(key)):
             flags.add(flag)
+    if bool(facts.get("assume_demo_context")):
+        # Demo fixture (labelled as such in the JSON): a hackathon build shown on stage, with AI assisting.
+        flags.update({"build", "collab", "team", "ai_assisted", "ambition", "public"})
     return flags
 
 

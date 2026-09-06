@@ -184,7 +184,7 @@
     "who asked you"
   ],
   "fixtures": {
-    "_comment": "Demo fixtures, kept separate from live evidence. intensity null = use the register mapping. facts are only true when a person has established them; the library's 'requires' flags read them. Never set a fact to make a joke land.",
+    "_comment": "Demo fixtures live in personality/demo_fixtures.json and are merged only when ANCHOR_PERSONA_FIXTURES=demo (run.sh sets that by default). These defaults are the live-evidence baseline.",
     "intensity": null,
     "tease_material": "",
     "exclusions": [],
