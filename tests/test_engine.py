@@ -155,6 +155,25 @@ def test_vision_only_when_unsure(settings, store, clock):
     assert sensor.grab_calls == 3
 
 
+def test_second_look_never_downgrades_a_confident_verdict(settings, store, clock):
+    settings.patience_s = 12
+    settings.roast_cooldown_s = 0
+    BLURRY = Verdict(drift=0.75, confidence=0.5, reason="screenshot unclear", activity="playing Drive Mad on poki.com")
+    GAME = Verdict(drift=0.95, confidence=0.98, reason="poki", activity="playing Drive Mad on poki.com")
+    eng, sensor, llm, speaker, _ = build(
+        settings, store, clock, replies=("checking my mails", "twenty minutes"), verdicts=[ON, GAME, BLURRY, BLURRY, BLURRY],
+    )
+    run(eng, clock, 2)
+    sensor.set(app="Google Chrome", title="Drive Mad - Play online for free! | Poki", url_domain="poki.com", idle_s=3.0, dhash="c" * 16)
+    run(eng, clock, 3)
+    assert eng.last_verdict.confidence >= 0.9
+    sensor.set(dhash="d" * 16)                                            # the game animates: forced second look
+    run(eng, clock, 2)
+    assert eng.last_verdict.confidence >= 0.9                             # the blurry look did not replace it
+    run(eng, clock, 15)
+    assert eng.conv.state == State.DETOUR                                 # ...so the timer kept filling
+
+
 def test_screenshot_never_persisted(settings, store, clock):
     eng, sensor, llm, _, _ = build(settings, store, clock, verdicts=[ON, AMBIG, OFF])
     run(eng, clock, 1)

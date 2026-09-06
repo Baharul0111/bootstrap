@@ -290,4 +290,8 @@ def test_make_voice_with_key_uses_openai_pair(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test-not-real")
     speaker, listener = make_voice(Settings())
     assert isinstance(speaker, OpenAISpeaker)
-    assert isinstance(listener, OpenAIListener)
+    from anchor.streaming_stt import RealtimeListener
+    assert isinstance(listener, RealtimeListener) and isinstance(listener.fallback, OpenAIListener)
+    monkeypatch.setenv("ANCHOR_STREAMING_STT", "0")
+    _, batch = make_voice(Settings())
+    assert isinstance(batch, OpenAIListener)

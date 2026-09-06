@@ -144,6 +144,7 @@ class Conversation:
         self.last_line = ""
         self.last_confrontation_ts: Optional[float] = None
         self.comebacks_used: set[str] = set()
+        self._current_activity: str = ""     # what the person is doing during the current confrontation
 
     # ------------------------------------------------------------------ helpers
     @property
@@ -171,6 +172,7 @@ class Conversation:
         if not text:
             return
         language = language or self.language()
+        t0 = self.now()
         if self.muted:
             self.transcript.append(f"anchor (muted): {text}")
         else:
@@ -180,10 +182,16 @@ class Conversation:
             except Exception:
                 pass
         self.last_line = text
+        try:   # timestamps for latency diagnosis: when the line started and how long playback took
+            self.store.log_event(self.anchor.id if self.anchor else None, "SAID",
+                                 f"{tone} {self.now() - t0:.1f}s: {text[:100]}", t0)
+        except Exception:
+            pass
 
     def hear(self, *, window_s: Optional[float] = None, language: Optional[str] = None) -> str:
         language = language or self.language()
         window = window_s if window_s is not None else self.settings.listen_window_s
+        t0 = self.now()
         try:
             text = (self.listener.listen(window_s=window, language=language) or "").strip()
         except Exception:
@@ -191,6 +199,11 @@ class Conversation:
         self.transcript.append(f"you: {text}" if text else "you: (silence)")
         if text:
             self.last_line = text
+        try:
+            self.store.log_event(self.anchor.id if self.anchor else None, "HEARD",
+                                 f"{self.now() - t0:.1f}s listening: {text[:100] or '(silence)'}", self.now())
+        except Exception:
+            pass
         return text
 
     def current_register(self) -> Register:
@@ -380,8 +393,12 @@ class Conversation:
                 intent.minutes = intent.minutes or default_minutes
             else:
                 intent.minutes = intent.minutes or local_minutes
-        if intent.intent == Intent.SWITCH and not (intent.new_anchor or "").strip():
-            intent.new_anchor = (local.new_anchor or reply).strip()
+        if intent.intent == Intent.SWITCH:
+            candidate = (intent.new_anchor or "").strip() or (local.new_anchor or "").strip()
+            if not H._extract_new_anchor(candidate) if candidate else True:
+                # "This is the new main thing" names nothing: the new main thing is what they are doing right now.
+                candidate = (self._current_activity or "").strip()
+            intent.new_anchor = candidate or reply.strip()
         if local.sentiment == Sentiment.IRRITATED:
             intent.sentiment = Sentiment.IRRITATED
         if intent.intent == Intent.EVASIVE and local.intent == Intent.RESUME:
@@ -421,6 +438,7 @@ class Conversation:
         push_used = False                                  # owned by this function, never by the model
         spoken: list[str] = []
         self.last_confrontation_ts = self.now()
+        self._current_activity = observed.activity
         self._set_state(State.CONFRONTING, observed.activity)
         lang = self.language()
         comp = precomposed or self.compose_for(observed)

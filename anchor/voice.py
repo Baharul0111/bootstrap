@@ -344,5 +344,13 @@ def make_voice(settings: Settings) -> tuple[Speaker, Listener]:
     if reply_file:
         return speaker, FileListener(reply_file)
     if api_key_present():
-        return speaker, OpenAIListener(settings)
+        batch = OpenAIListener(settings)
+        if os.environ.get("ANCHOR_STREAMING_STT", "1").strip().lower() not in {"0", "false", "no", "off"}:
+            try:
+                from .streaming_stt import RealtimeListener
+
+                return speaker, RealtimeListener(settings, fallback=batch)
+            except Exception:
+                pass
+        return speaker, batch
     return speaker, FakeListener()

@@ -452,7 +452,11 @@ class Engine:
                 v2 = self._llm_judge(anchor, policy, frame, refinements, image)
                 image = None                                   # forget it immediately
                 if v2 is not None:
-                    verdict = v2
+                    prev = self.last_verdict if decision.force_vision and self.last_fingerprint == fp else None
+                    if prev is not None and prev.confidence >= 0.8 and v2.confidence < 0.6:
+                        verdict = prev                         # a blurry second look never erases a confident call
+                    else:
+                        verdict = v2
 
         if verdict is None:
             verdict = H.judge_heuristic(anchor.clarified or anchor.verbatim, policy, frame)

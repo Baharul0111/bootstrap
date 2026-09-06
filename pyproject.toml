@@ -16,6 +16,7 @@ dependencies = [
     "Pillow",
     "dhash",
     "pydantic>=2",
+    "websockets>=12",
 ]
 
 [project.optional-dependencies]

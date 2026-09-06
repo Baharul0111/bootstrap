@@ -371,7 +371,13 @@ def _extract_new_anchor(text: str) -> str:
             break
         stripped = new
     stripped = re.sub(r"^(?:i'?m |i am |main )", "", stripped, flags=re.IGNORECASE).strip() or stripped
-    return stripped.strip(" ,.:-") or text.strip()
+    stripped = stripped.strip(" ,.:-")
+    # "This is the new main thing." on its own names nothing: return "" so the caller uses what is on screen.
+    if not stripped or not _content_words(stripped) or all(
+        w in {"new", "main", "thing", "this", "now", "goal", "task", "switch"} for w in _content_words(stripped)
+    ):
+        return ""
+    return stripped
 
 
 def classify_reply_keywords(text: str, default_minutes: int, now: Optional[float] = None) -> ReplyIntent:

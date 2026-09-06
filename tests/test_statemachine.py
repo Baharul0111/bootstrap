@@ -306,6 +306,16 @@ def test_switch_branch_adopts_new_sentence_without_question(settings, store, clo
     assert len(listener.calls) == 2                # intake + the reply; no clarifying question mid-flow
 
 
+@pytest.mark.parametrize("reply", ["This is the new main thing.", "new main thing", "this is the main thing now", "switch"])
+def test_switch_that_names_nothing_takes_the_current_activity(settings, store, clock, reply):
+    conv, speaker, listener = anchored(settings, store, clock, replies=[reply])
+    out = conv.confront(Observed(activity="messaging contacts on WhatsApp", app="Google Chrome",
+                                 title="WhatsApp", url_domain="web.whatsapp.com", minutes_off_task=1, confidence=0.98))
+    assert out.intent == Intent.SWITCH
+    assert conv.anchor.verbatim == "messaging contacts on WhatsApp"
+    assert len(listener.calls) == 2                                      # still no follow-up question
+
+
 def test_switch_with_vague_sentence_still_asks_nothing(settings, store, clock):
     llm = FakeLLM(replies=[ReplyIntent(Intent.SWITCH, new_anchor="study")])
     conv, speaker, listener = anchored(settings, store, clock, replies=["new thing: study"], llm=llm)
