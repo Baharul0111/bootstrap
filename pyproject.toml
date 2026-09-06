@@ -1,0 +1,26 @@
+[project]
+name = "anchor"
+version = "0.1.0"
+description = "A quiet menu-bar helper that holds you to the one sentence you said you were going to do."
+requires-python = ">=3.11"
+dependencies = [
+    "openai>=1.60",
+    "rumps>=0.4",
+    "pyobjc-framework-Quartz",
+    "pyobjc-framework-Cocoa",
+    "pyobjc-framework-ApplicationServices",
+    "sounddevice",
+    "numpy",
+    "webrtcvad-wheels",
+    "python-dotenv",
+    "Pillow",
+    "dhash",
+    "pydantic>=2",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

@@ -1,0 +1,262 @@
+"""The protected part: one push-back, three branches, one clarifying question, ceilings."""
+
+from __future__ import annotations
+
+import pytest
+
+from anchor.llm import FakeLLM
+from anchor.models import Intent, Observed, Policy, PolicyDraft, Register, ReplyIntent, Sentiment, State
+from anchor.statemachine import Conversation
+from anchor.voice import FakeListener, FakeSpeaker
+from anchor import roast as R
+
+
+def make_conv(settings, store, clock, replies, llm=None, muted=False):
+    speaker = FakeSpeaker()
+    listener = FakeListener(list(replies))
+    conv = Conversation(settings, store, llm or FakeLLM(), speaker, listener, clock, is_muted=lambda: muted)
+    return conv, speaker, listener
+
+
+def anchored(settings, store, clock, sentence="I need to finish the assignment tonight", replies=(), llm=None):
+    conv, speaker, listener = make_conv(settings, store, clock, [sentence] + list(replies), llm=llm)
+    conv.start_session()
+    return conv, speaker, listener
+
+
+def observed(minutes=12, confidence=0.95):
+    return Observed(activity="researching whether crabs can swim on Google", app="Google Chrome",
+                    title="crabs can swim? - Google Search", url_domain="google.com",
+                    minutes_off_task=minutes, confidence=confidence)
+
+
+# ----------------------------------------------------------------------------- intake
+
+def test_intake_stores_verbatim_and_speaks_disclosure_once(settings, store, clock):
+    conv, speaker, _ = anchored(settings, store, clock)
+    assert conv.state == State.WATCHING
+    assert conv.anchor.verbatim == "I need to finish the assignment tonight"
+    spoken = [t for t, _, _ in speaker.calls]
+    assert any("computer-generated" in s for s in spoken)
+    # second session on the same DB: no disclosure again
+    conv2, speaker2, _ = make_conv(settings, store, clock, [])
+    conv2.start_session()  # resumes
+    assert not any("computer-generated" in t for t, _, _ in speaker2.calls)
+
+
+def test_resume_picks_up_same_anchor(settings, store, clock):
+    conv, _, _ = anchored(settings, store, clock)
+    conv2, _, _ = make_conv(settings, store, clock, [])
+    a = conv2.start_session()
+    assert a.id == conv.anchor.id and conv2.state == State.WATCHING
+    assert conv2.policy is not None
+
+
+def test_vague_sentence_gets_exactly_one_question(settings, store, clock):
+    conv, speaker, listener = anchored(settings, store, clock, sentence="study", replies=["the DBMS assignment, section 3"])
+    spoken = [t for t, _, _ in speaker.calls]
+    questions = [s for s in spoken if s.endswith("?") and "working on right now" not in s]
+    assert len(questions) == 1
+    assert conv.anchor.verbatim == "study"
+    assert "DBMS" in conv.anchor.clarified
+    assert len(listener.calls) == 2  # sentence + one answer, never a third listen at intake
+
+
+def test_clear_sentence_gets_no_question(settings, store, clock):
+    conv, speaker, listener = anchored(settings, store, clock)
+    assert len(listener.calls) == 1
+
+
+def test_hindi_sentence_sets_language(settings, store, clock):
+    conv, speaker, _ = anchored(settings, store, clock, sentence="मुझे आज रात असाइनमेंट खत्म करना है")
+    assert conv.anchor.language == "hi"
+    assert speaker.calls[-1][1] == "hi"
+
+
+def test_policy_from_task_kind(settings, store, clock):
+    c1, _, _ = anchored(settings, store, clock, sentence="fix the login bug in the python backend")
+    coding = c1.policy.patience_seconds
+    store2 = type(store)(settings.db_path.with_name("b.db")).open()
+    c2, _, _ = anchored(settings, store2, clock, sentence="write the essay on climate policy")
+    writing = c2.policy.patience_seconds
+    store3 = type(store)(settings.db_path.with_name("c.db")).open()
+    c3, _, _ = anchored(settings, store3, clock, sentence="watch the operating systems lecture")
+    assert coding > writing
+    assert c3.policy.patience_seconds > coding
+    assert c3.policy.pause_idle_s is None
+
+
+def test_demo_tempo_cuts_patience_but_keeps_shape(settings, store, clock):
+    settings.demo = True
+    conv, _, _ = anchored(settings, store, clock, sentence="I am learning about AI agents")
+    assert conv.policy.patience_seconds == 10 and conv.policy.pause_idle_s == 2 and conv.policy.pause_stable_s == 3
+    assert store.load_policy(conv.anchor.id).patience_seconds == 180      # stored policy is the real one
+    first_id = conv.anchor.id
+    conv2, speaker2, _ = make_conv(settings, store, clock, ["solving a DSA question on leetcode"])
+    conv2.start_session()                                                  # demo launch asks again, every time
+    assert conv2.anchor.id != first_id and store.get_anchor(first_id).status == "retired"
+    assert any("working on right now" in t for t, _, _ in speaker2.calls)
+    assert conv2.policy.patience_seconds == 10
+    store3 = type(store)(settings.db_path.with_name("w.db")).open()
+    c3, _, _ = anchored(settings, store3, clock, sentence="watch the operating systems lecture")
+    assert c3.policy.patience_seconds == 10 and c3.policy.pause_idle_s is None
+    settings.demo = False
+    conv4, _, _ = make_conv(settings, store, clock, [])
+    conv4.start_session()                                                  # normal mode still resumes
+    assert conv4.anchor.id == conv2.anchor.id and conv4.policy.patience_seconds == 180
+
+
+def test_serious_goal_disables_humour(settings, store, clock):
+    conv, _, _ = anchored(settings, store, clock, sentence="sort out my hospital bills and the loan paperwork")
+    assert conv.policy.humor_ok is False
+
+
+# ----------------------------------------------------------------------------- confrontation
+
+def test_roast_then_choice_then_defer(settings, store, clock):
+    conv, speaker, _ = anchored(settings, store, clock, replies=["give me twenty minutes"])
+    out = conv.confront(observed())
+    assert out.intent == Intent.DEFER and out.minutes == 20 and out.pushed is False
+    first = out.spoken[0]
+    assert "crabs" in first.lower() and "12" in first
+    assert first.rstrip().endswith("?")            # the forced choice comes in the same breath
+    assert conv.state == State.DETOUR
+    assert conv.anchor.detour_until == pytest.approx(clock.now() + 20 * 60)
+    assert store.active_anchor().detour_until == pytest.approx(clock.now() + 20 * 60)
+    assert "20" in out.spoken[-1]                  # repeats the amount back
+
+
+def test_evasive_gets_exactly_one_flat_pushback_then_accepts(settings, store, clock):
+    conv, speaker, listener = anchored(settings, store, clock, replies=["hmm whatever", "yeah still true, twenty minutes"])
+    out = conv.confront(observed())
+    assert out.pushed is True
+    push = [c for c in speaker.calls if c[2] == "flat"]
+    assert len(push) == 1
+    assert push[0][0] == R.pushback_line(conv.anchor.verbatim, "en")
+    assert conv.anchor.verbatim in push[0][0]
+    assert out.intent == Intent.DEFER and out.minutes == 20
+
+
+def test_silence_counts_as_evasive_and_double_evasive_defaults_to_detour(settings, store, clock):
+    conv, speaker, listener = anchored(settings, store, clock, replies=["", ""])
+    out = conv.confront(observed())
+    assert out.pushed is True
+    assert out.intent == Intent.DEFER and out.minutes == settings.default_detour_minutes == 15
+    flat = [c for c in speaker.calls if c[2] == "flat"]
+    assert len(flat) == 1                          # never two push-backs
+    assert len(listener.calls) == 1 + 2            # intake + roast reply + push-back reply, nothing more
+
+
+def test_pushback_never_repeats_even_if_llm_says_evasive_forever(settings, store, clock):
+    llm = FakeLLM(replies=[ReplyIntent(Intent.EVASIVE)] * 10)
+    conv, speaker, listener = anchored(settings, store, clock, replies=["meh", "meh", "meh", "meh"], llm=llm)
+    out = conv.confront(observed())
+    assert len([c for c in speaker.calls if c[2] == "flat"]) == 1
+    assert out.intent == Intent.DEFER
+
+
+def test_switch_branch_adopts_new_sentence_without_question(settings, store, clock):
+    conv, speaker, listener = anchored(settings, store, clock, replies=["actually this is the new main thing, I'm building my resume now"])
+    old_id = conv.anchor.id
+    out = conv.confront(observed())
+    assert out.intent == Intent.SWITCH
+    assert store.get_anchor(old_id).status == "retired"
+    assert conv.anchor.id != old_id and conv.state == State.WATCHING
+    assert "resume" in conv.anchor.verbatim
+    assert len(listener.calls) == 2                # intake + the reply; no clarifying question mid-flow
+
+
+def test_switch_with_vague_sentence_still_asks_nothing(settings, store, clock):
+    llm = FakeLLM(replies=[ReplyIntent(Intent.SWITCH, new_anchor="study")])
+    conv, speaker, listener = anchored(settings, store, clock, replies=["new thing: study"], llm=llm)
+    conv.confront(observed())
+    assert conv.anchor.verbatim == "study"
+    assert len(listener.calls) == 2
+
+
+def test_done_branch_congratulates_and_asks_whats_next(settings, store, clock):
+    conv, speaker, listener = anchored(settings, store, clock, replies=["it's done, I finished it", "now I'm writing the lab report"])
+    old_id = conv.anchor.id
+    out = conv.confront(observed())
+    assert out.intent == Intent.DONE
+    assert store.get_anchor(old_id).status == "completed"
+    spoken = [t for t, _, _ in speaker.calls]
+    assert any(t == R.congrats("en") for t in spoken)
+    assert any(t == R.whats_next("en") for t in spoken)
+    assert conv.anchor.verbatim == "now I'm writing the lab report" and conv.state == State.WATCHING
+
+
+def test_repeat_confrontations_get_shorter(settings, store, clock):
+    conv, speaker, _ = anchored(settings, store, clock, replies=["ten minutes", "ten minutes", "ten minutes"])
+    lengths = []
+    for _ in range(3):
+        conv.anchor.detour_until = None
+        store.set_detour(conv.anchor.id, None)
+        conv.state = State.WATCHING
+        out = conv.confront(observed())
+        roast_part = out.spoken[0].replace(R.choice_line("en"), "").strip()
+        lengths.append(len(roast_part.split()))
+    assert lengths[0] >= lengths[1] >= lengths[2]
+    assert lengths[2] <= 8
+
+
+def test_irritated_reply_cools_register_for_the_day_and_never_climbs(settings, store, clock):
+    conv, speaker, _ = anchored(settings, store, clock, replies=["ugh stop, twenty minutes", "twenty minutes"])
+    assert conv.current_register() == Register.PLAYFUL
+    conv.confront(observed())
+    assert conv.current_register() == Register.DRY
+    conv.anchor.detour_until = None
+    conv.state = State.WATCHING
+    conv.confront(observed())                      # amused/neutral reply does not warm it back up
+    assert conv.current_register() == Register.DRY
+    clock.advance(24 * 3600)                       # a new day resets to the default
+    assert conv.current_register() == Register.PLAYFUL
+
+
+def test_low_confidence_gets_hedge_not_joke(settings, store, clock):
+    conv, speaker, _ = anchored(settings, store, clock, replies=["ten minutes"])
+    out = conv.confront(observed(confidence=0.5))
+    assert out.joke_used is False
+    assert speaker.calls[-2][2] != "roast"
+
+
+def test_serious_anchor_gets_plain_statement(settings, store, clock):
+    conv, speaker, _ = anchored(settings, store, clock, sentence="deal with my hospital bills tonight", replies=["ten minutes"])
+    out = conv.confront(observed())
+    assert out.joke_used is False
+
+
+def test_muted_conversation_speaks_nothing(settings, store, clock):
+    conv, speaker, listener = make_conv(settings, store, clock, ["finish the assignment", "ten minutes"], muted=True)
+    conv.start_session()
+    conv.confront(observed())
+    assert speaker.calls == []
+    assert any(l.startswith("anchor (muted)") for l in conv.transcript)
+
+
+def test_hourly_ceiling(settings, store, clock):
+    conv, speaker, _ = anchored(settings, store, clock, replies=["ten minutes"] * 6)
+    for i in range(4):
+        assert conv.may_confront()
+        conv.confront(observed())
+        conv.anchor.detour_until = None
+        conv.state = State.WATCHING
+        clock.advance(60)
+    assert conv.may_confront() is False
+    clock.advance(3600)
+    assert conv.may_confront() is True
+
+
+def test_no_confrontation_during_detour(settings, store, clock):
+    conv, _, _ = anchored(settings, store, clock, replies=["twenty minutes"])
+    conv.confront(observed())
+    assert conv.may_confront() is False
+
+
+def test_hindi_confrontation_is_native(settings, store, clock):
+    conv, speaker, _ = anchored(settings, store, clock, sentence="मुझे आज रात असाइनमेंट खत्म करना है", replies=["बीस मिनट"])
+    out = conv.confront(observed())
+    line = out.spoken[0]
+    assert any("ऀ" <= ch <= "ॿ" for ch in line)
+    assert out.intent == Intent.DEFER and out.minutes == 20
+    assert speaker.calls[-2][1] == "hi"
